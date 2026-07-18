@@ -19,8 +19,10 @@ Setup
 
 Behavior
 --------
-- Posts one nowcast on startup, then every hour at xx:05 UTC (≈14 min after
-  the :51 METAR drop, with retry on stale obs).
+- Posts one nowcast on startup, then every hour at xx:55 UTC (KNYC's METAR
+  drops ~:51-:53 via aviationweather.gov's live feed). If the fresh ob hasn't
+  landed yet, retries every 60s until it does (capped at 50 min so a dead
+  feed can't stall past the next hourly tick).
 - Each post: current temp, dewpoint, RH, wind, t+3h, t+6h, model daily high,
   observed high so far, floor-locked reassessed high.
 """
@@ -34,7 +36,6 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from io import StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -95,68 +96,69 @@ log.info("✅ Models + manifest loaded (%d features)", len(FEATURE_COLS))
 # ── Constants ──────────────────────────────────────────────────────────────
 KNYC_LAT, KNYC_LON = 40.7794, -73.9692
 PRIMARY = "KNYC"
-IEM_VARS = "tmpf,dwpf,relh,drct,sknt,mslp,p01i,skyc1,skyc2,skyc3,skyl1,feel,metar"
 SKY_TO_OKTAS = {"CLR": 0, "SKC": 0, "NSC": 0, "NCD": 0,
                 "FEW": 2, "SCT": 4, "BKN": 6, "OVC": 8, "VV": 8}
 SANITY = {"tmpf": (-30, 115), "dwpf": (-40, 90), "relh": (0, 100),
           "drct": (0, 360), "sknt": (0, 90), "mslp": (940, 1060),
           "p01i": (0, 10), "feel": (-60, 130)}
 STALENESS_LIMIT = timedelta(minutes=90)
+AVWX_URL = "https://aviationweather.gov/api/data/metar"
 
 
-# ── IEM fetch ──────────────────────────────────────────────────────────────
-def fetch_iem(station: str, hours_back: int, primary: bool = True) -> pd.DataFrame:
-    """primary=True keeps strict :51 obs; primary=False normalizes other-cadence
-    stations to :51 so they merge cleanly against KNYC."""
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=hours_back)
-    end = now + timedelta(hours=1)
-    url = (
-        "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-        f"?station={station}&data={IEM_VARS}"
-        f"&year1={start.year}&month1={start.month:02d}&day1={start.day:02d}&hour1={start.hour:02d}"
-        f"&year2={end.year}&month2={end.month:02d}&day2={end.day:02d}&hour2={end.hour:02d}"
-        "&tz=UTC&format=comma&latlon=no&elev=no&missing=M&trace=T&direct=no&report_type=3"
-        f"&_nocache={int(now.timestamp())}"
-    )
-    # Retry with backoff on rate-limit (IEM throttles ~5 req/sec per IP).
+# ── aviationweather.gov fetch ───────────────────────────────────────────────
+def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
+    """Live METAR feed (FAA/NWS text data server) — a given hour's ob is
+    queryable within ~2 min of being issued, unlike IEM's archive CGI which
+    re-ingests on its own, inconsistent schedule.
+
+    Normalizes every station onto the :51 grid the models were trained on,
+    since a routine METAR can post a minute or two off nominal.
+    """
+    params = {"ids": station, "format": "json", "hours": hours_back}
     for attempt in range(4):
         try:
-            resp = requests.get(url, timeout=30, headers={"Cache-Control": "no-cache"})
-            if resp.status_code == 429:
-                wait = 10 * (attempt + 1)
-                log.warning("IEM 429 for %s — sleeping %ds", station, wait)
-                time.sleep(wait)
-                continue
+            resp = requests.get(AVWX_URL, params=params, timeout=30)
             resp.raise_for_status()
             break
         except requests.RequestException as exc:
             if attempt == 3:
                 raise
-            log.warning("IEM fetch %s attempt %d failed: %s", station, attempt + 1, exc)
+            log.warning("aviationweather.gov fetch %s attempt %d failed: %s",
+                        station, attempt + 1, exc)
             time.sleep(5 * (attempt + 1))
     else:
-        raise RuntimeError(f"IEM fetch failed for {station} after retries")
-    text = "\n".join(l for l in resp.text.splitlines()
-                     if not l.startswith("#") and l.strip())
-    if not text or "\n" not in text:
+        raise RuntimeError(f"aviationweather.gov fetch failed for {station} after retries")
+
+    records = [r for r in resp.json() if r.get("metarType") == "METAR"]
+    if not records:
         return pd.DataFrame()
 
-    df = pd.read_csv(StringIO(text))
-    df.columns = df.columns.str.strip()
-    if "valid" not in df.columns or df.empty:
-        return pd.DataFrame()
-    df["valid"] = pd.to_datetime(df["valid"]).dt.tz_localize("UTC")
-    if primary:
-        df = df[df["valid"].dt.minute == 51].copy()
-    else:
-        df = df[df["valid"].dt.minute.between(45, 59)].copy()
-        df["valid"] = df["valid"].dt.floor("1h") + pd.Timedelta(minutes=51)
-        df = df.drop_duplicates("valid", keep="last")
+    rows = []
+    for r in records:
+        clouds = r.get("clouds") or []
+        wdir = r.get("wdir")
+        temp_c, dewp_c = r.get("temp"), r.get("dewp")
+        rows.append({
+            "valid": datetime.fromtimestamp(r["obsTime"], tz=timezone.utc),
+            "tmpf": temp_c * 9 / 5 + 32 if temp_c is not None else np.nan,
+            "dwpf": dewp_c * 9 / 5 + 32 if dewp_c is not None else np.nan,
+            "drct": wdir if isinstance(wdir, (int, float)) else np.nan,
+            "sknt": r.get("wspd", np.nan),
+            "mslp": r.get("slp", np.nan),
+            "p01i": r.get("precip", np.nan),
+            "skyc1": clouds[0]["cover"] if len(clouds) > 0 else np.nan,
+            "skyc2": clouds[1]["cover"] if len(clouds) > 1 else np.nan,
+            "skyc3": clouds[2]["cover"] if len(clouds) > 2 else np.nan,
+            "skyl1": clouds[0]["base"] if len(clouds) > 0 else np.nan,
+            "metar": r.get("rawOb"),
+        })
 
-    for col in ["tmpf", "dwpf", "relh", "drct", "sknt", "mslp", "p01i", "skyl1", "feel"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = pd.DataFrame(rows)
+    df["valid"] = df["valid"].dt.floor("1h") + pd.Timedelta(minutes=51)
+    df = df.drop_duplicates("valid", keep="last")
+
+    for col in ["tmpf", "dwpf", "drct", "sknt", "mslp", "p01i", "skyl1"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     for col, (lo, hi) in SANITY.items():
         if col in df.columns:
             df.loc[(df[col] < lo) | (df[col] > hi), col] = np.nan
@@ -333,19 +335,18 @@ def _apply_climatology(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Nowcast ────────────────────────────────────────────────────────────────
 def get_nowcast() -> dict:
-    raw = fetch_iem(PRIMARY, hours_back=72)
+    raw = fetch_avwx(PRIMARY, hours_back=72)
     if raw.empty:
-        raise RuntimeError("IEM returned no KNYC obs")
+        raise RuntimeError("aviationweather.gov returned no KNYC obs")
 
     upstream = {}
     for s in UPSTREAM:
         try:
-            upstream[s] = fetch_iem(s, hours_back=72, primary=False)
+            upstream[s] = fetch_avwx(s, hours_back=72)
         except Exception as exc:
             log.warning("Upstream %s fetch failed: %s — proceeding with NaN", s, exc)
             upstream[s] = pd.DataFrame()
-        # Polite gap between IEM calls to stay under the per-IP rate limit.
-        time.sleep(1.5)
+        time.sleep(0.3)
 
     df = engineer_features(raw, upstream)
     df = _apply_climatology(df)
@@ -472,7 +473,7 @@ def build_embed(data: dict) -> discord.Embed:
         value=f"**{data['reassessed']:.1f}°F**{obs_note}",
         inline=True,
     )
-    embed.set_footer(text="XGBoost · KNYC ASOS + upstream · IEM · NWS CLI")
+    embed.set_footer(text="XGBoost · KNYC ASOS + upstream · aviationweather.gov · NWS CLI")
     return embed
 
 
@@ -480,8 +481,21 @@ def build_embed(data: dict) -> discord.Embed:
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 
+last_posted_valid: datetime | None = None
+FRESH_RETRY_DEADLINE = timedelta(minutes=50)
+FRESH_RETRY_INTERVAL = timedelta(seconds=60)
 
-async def post_nowcast_to_channel() -> None:
+
+async def post_nowcast_to_channel(*, wait_for_fresh: bool = False) -> None:
+    """Fetch + post a nowcast embed.
+
+    wait_for_fresh=True (the hourly :55 tick): if the newest available METAR
+    is the same one already posted last hour, retry every 60s until a newer
+    ob shows up — KNYC's METAR usually lands ~:51-:53 but can run late.
+    Capped at FRESH_RETRY_DEADLINE so a dead feed can't stall past the next
+    scheduled tick.
+    """
+    global last_posted_valid
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         log.error("Guild %s not found", GUILD_ID)
@@ -491,20 +505,46 @@ async def post_nowcast_to_channel() -> None:
         log.error("No #%s channel in %s", CHANNEL_NAME, guild.name)
         return
 
+    deadline = datetime.now(timezone.utc) + FRESH_RETRY_DEADLINE if wait_for_fresh else None
     last_exc: Exception | None = None
-    for attempt in range(3):
+    attempt = 0
+
+    while True:
+        attempt += 1
         try:
             data = get_nowcast()
-            embed = build_embed(data)
-            await channel.send(embed=embed)
-            log.info("Posted — reassessed high %.1f°F", data["reassessed"])
-            return
+            stale = (
+                wait_for_fresh
+                and last_posted_valid is not None
+                and data["valid_t"] <= last_posted_valid
+            )
+            if not stale:
+                embed = build_embed(data)
+                await channel.send(embed=embed)
+                last_posted_valid = data["valid_t"]
+                log.info("Posted — reassessed high %.1f°F (valid %s)",
+                          data["reassessed"], data["valid_t"].isoformat())
+                return
+            log.info("METAR still %s (no newer ob yet) — retrying in 60s",
+                      data["valid_t"].isoformat())
+            last_exc = None
         except Exception as exc:
             last_exc = exc
-            log.warning("Attempt %d failed: %s", attempt + 1, exc)
-            await asyncio.sleep(120 * (attempt + 1))
+            log.warning("Nowcast attempt %d failed: %s", attempt, exc)
 
-    await channel.send(f"⚠️ Nowcaster error after 3 attempts: `{last_exc}`")
+        if deadline is not None:
+            if datetime.now(timezone.utc) >= deadline:
+                await channel.send(
+                    f"⚠️ No fresh METAR after {int(FRESH_RETRY_DEADLINE.total_seconds() // 60)} "
+                    f"min of retrying: `{last_exc or 'still on previous obs'}`"
+                )
+                return
+            await asyncio.sleep(FRESH_RETRY_INTERVAL.total_seconds())
+        else:
+            if attempt >= 3:
+                await channel.send(f"⚠️ Nowcaster error after 3 attempts: `{last_exc}`")
+                return
+            await asyncio.sleep(120 * attempt)
 
 
 @bot.event
@@ -517,15 +557,17 @@ async def on_ready() -> None:
 
 @tasks.loop(hours=1)
 async def nowcast_loop() -> None:
-    await post_nowcast_to_channel()
+    await post_nowcast_to_channel(wait_for_fresh=True)
 
 
 @nowcast_loop.before_loop
 async def before_nowcast_loop() -> None:
-    """Align to :05 UTC each hour — gives IEM ~14 min to ingest the :51 METAR."""
+    """Align to :55 UTC each hour — aviationweather.gov has the :51 METAR
+    within ~2 min, so :55 gives a small buffer instead of IEM's old ~14 min
+    ingest lag."""
     await bot.wait_until_ready()
     now = datetime.now(timezone.utc)
-    next_run = now.replace(minute=5, second=0, microsecond=0)
+    next_run = now.replace(minute=55, second=0, microsecond=0)
     if next_run <= now:
         next_run += timedelta(hours=1)
     wait = (next_run - now).total_seconds()

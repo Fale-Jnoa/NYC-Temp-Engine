@@ -136,12 +136,24 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
 
     CLI bulletins are issued in the evening for the prior day's totals;
     midnight-LST max is the official daily high.
+
+    Two IEM AFOS gotchas handled here:
+      * retrieve.py defaults to limit=1 (newest bulletin only); an explicit
+        limit bounded by sdate/edate is required to get the whole range.
+      * The day-D final report is transmitted the morning of D+1, so its
+        issuance-header date is a day ahead of the data — key off the
+        "CLIMATE SUMMARY FOR <date>" line, not the header, or highs land on
+        the wrong date. Multiple issuances per date (preliminary + final) are
+        collapsed by keeping the max, so a partial-day preliminary can't
+        under-report a high that occurred after it was issued.
     """
+    ndays = (end - start).days + 4
     url = (
         "https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py"
         "?pil=CLINYC"
         f"&sdate={start.strftime('%Y-%m-%d')}"
         f"&edate={end.strftime('%Y-%m-%d')}"
+        f"&limit={max(200, ndays * 5)}"
         "&fmt=text"
     )
     resp = requests.get(url, timeout=180)
@@ -154,7 +166,7 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
     bulletins = re.split(r"\x01|000\s*\n", text)
     records = []
     for b in bulletins:
-        date_m = re.search(r"CLIMATE REPORT[\s\S]{0,400}?(\w+\s+\d{1,2}\s+\d{4})", b)
+        date_m = re.search(r"CLIMATE SUMMARY FOR\s+(\w+\s+\d{1,2}\s+\d{4})", b)
         max_m = re.search(r"MAXIMUM\s+(-?\d{1,3})\s", b)
         if not (date_m and max_m):
             continue
@@ -168,7 +180,9 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
         print("  WARNING: no CLI records parsed — falling back to METAR 6h-max")
         return pd.DataFrame(columns=["local_date", "cli_max"])
 
-    cli = pd.DataFrame(records).drop_duplicates("local_date").sort_values("local_date")
+    cli = (pd.DataFrame(records)
+             .groupby("local_date", as_index=False)["cli_max"].max()
+             .sort_values("local_date"))
     return cli
 
 
