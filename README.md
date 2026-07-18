@@ -38,12 +38,16 @@ A model is only useful insofar as it beats persistence; on the test set all thre
 
 ## Scoring live accuracy
 
-[score_predictions.py](score_predictions.py) is a post-hoc scorer for the predictions in `nowcast_log.csv`. Run it after a test window to grade each model against settled ground truth:
+The bot **auto-posts a daily scorecard** to a `#score` channel every morning at **6:30 AM ET**, grading the previous day's predictions. It runs next-morning rather than at midnight because the last few t+3h/t+6h targets of a day fall after midnight and the official CLI high often finalizes overnight — 6:30 AM is the first moment the day is fully settled. Each card shows the actual high (and its source), the daily-high model's pre-high accuracy, and the t+3h/t+6h hit counts.
+
+The same scoring logic is also available as a standalone CLI, [score_predictions.py](score_predictions.py), for grading arbitrary ranges of `nowcast_log.csv` after the fact:
 
 ```
 python score_predictions.py                          # scores nowcast_log.csv
 python score_predictions.py --start 2026-07-20 --end 2026-08-03 --out score_out
 ```
+
+Both share the same rules:
 
 - **Daily high** — scored only on predictions issued *before* the high actually occurred (afterward the obs-floor makes it trivially correct), using the official CLI high and its time. Reports MAE, hit-rates, a 0–100 skill score, and the issue-hours / lead-times where the model is most accurate.
 - **t+3h / t+6h** — scored out of 24 per NY-local day: 1 point per hourly prediction within ±1 °F of the actual temperature at the target time, plus MAE and best/worst hours.
@@ -75,4 +79,4 @@ This writes `knyc_training.csv` (gitignored). Then run [KNYC_Nowcaster.ipynb](KN
 python knyc_discord_bot.py
 ```
 
-Posts one nowcast on startup, then every hour at **:55 UTC**. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick).
+Posts one nowcast on startup, then every hour at **:55 UTC** to `#predictions`. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick). It also posts the daily scorecard to `#score` at 6:30 AM ET (see [Scoring](#scoring-live-accuracy)). Both channels must exist in the guild.

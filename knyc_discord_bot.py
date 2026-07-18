@@ -35,7 +35,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -47,6 +47,8 @@ from dotenv import load_dotenv
 
 import discord
 from discord.ext import tasks
+
+import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
 
 NY_TZ = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
@@ -64,6 +66,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
 CHANNEL_NAME = "predictions"
+SCORE_CHANNEL_NAME = "score"
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN not set in .env")
@@ -553,6 +556,8 @@ async def on_ready() -> None:
     await post_nowcast_to_channel()
     if not nowcast_loop.is_running():
         nowcast_loop.start()
+    if not scorecard_loop.is_running():
+        scorecard_loop.start()
 
 
 @tasks.loop(hours=1)
@@ -574,6 +579,137 @@ async def before_nowcast_loop() -> None:
     log.info("Hourly loop aligned — first tick at %s (%d min)",
              next_run.astimezone(NY_TZ).strftime("%H:%M %Z"), wait // 60)
     await asyncio.sleep(wait)
+
+
+# ── End-of-day scorecard ───────────────────────────────────────────────────
+# Posted next morning (not at midnight): the last few t+3h/t+6h targets of a
+# day spill past midnight, and the official CLI high often finalizes overnight,
+# so an early-morning run is the first moment the day is fully settled.
+SCORE_POST_TIME = dtime(hour=6, minute=30, tzinfo=NY_TZ)
+
+
+def _compute_scorecard(target_date) -> dict:
+    """Blocking: fetch settled ground truth and score one NY-local day. Runs in
+    a worker thread so the multi-request fetch never blocks the heartbeat."""
+    preds = scorer.load_predictions(LOG_PATH)
+    preds = preds[preds["local_date"] == target_date]
+    if preds.empty:
+        return {"target_date": target_date, "empty": True}
+
+    lo = preds["valid_utc"].min().to_pydatetime() - timedelta(hours=1)
+    hi = preds["valid_utc"].max().to_pydatetime() + timedelta(hours=7)
+    obs = scorer.fetch_hourly_obs(lo, hi)
+    cli = scorer.fetch_cli(lo, hi)
+    try:
+        dsm = scorer.fetch_dsm(lo, hi)
+    except Exception as exc:
+        log.warning("DSM fetch failed for scorecard: %s", exc)
+        dsm = pd.DataFrame()
+
+    daily = scorer.build_daily_high(obs, cli, dsm)
+    drow = daily[daily["local_date"] == target_date]
+    return {
+        "target_date": target_date, "empty": False, "n_preds": len(preds),
+        "daily_row": drow.iloc[0].to_dict() if not drow.empty else None,
+        "dh": scorer.score_daily_high(preds, daily),
+        "s3": scorer.score_horizon(preds, obs, 3, "pred_t3h"),
+        "s6": scorer.score_horizon(preds, obs, 6, "pred_t6h"),
+    }
+
+
+def _fmt_clock(dt) -> str:
+    if dt is None:
+        return "?"
+    h = dt.hour % 12 or 12
+    return f"{h}:{dt.minute:02d} {'PM' if dt.hour >= 12 else 'AM'}"
+
+
+def build_scorecard_embed(data: dict) -> discord.Embed:
+    d = data["target_date"]
+    row, dh, s3, s6 = data["daily_row"], data["dh"], data["s3"], data["s6"]
+
+    if row is not None and pd.notna(row.get("actual_high")):
+        desc = (f"Actual high **{row['actual_high']:.0f}°F** "
+                f"({row.get('high_source') or '?'}, {_fmt_clock(row.get('high_time'))})")
+        color = _temp_color(float(row["actual_high"]))
+    else:
+        desc, color = "Actual high unavailable.", 0x2A9D8F
+
+    embed = discord.Embed(
+        title=f"📊 KNYC Scorecard — {d:%B} {d.day}, {d.year}",
+        description=desc, color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if dh.get("n_eligible", 0) > 0 and "per_day" in dh:
+        pr = dh["per_day"].iloc[0]
+        plural = "s" if dh["n_eligible"] != 1 else ""
+        embed.add_field(
+            name="🌡️ Daily High Model",
+            value=(f"MAE **{dh['mae']:.1f}°F** · within ±1°F: {dh['within_1']:.0f}% · "
+                   f"skill {dh['skill_pct']:.0f}/100\n"
+                   f"Earliest call {pr['earliest_lead_h']:.1f}h out, "
+                   f"off {pr['earliest_err']:.1f}°F\n"
+                   f"*(scored on {dh['n_eligible']} pre-high forecast{plural})*"),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🌡️ Daily High Model",
+            value=(f"*No pre-high forecasts to score ({dh.get('n_predictions', 0)} logged, "
+                   f"all issued after the high).*"),
+            inline=False,
+        )
+
+    def horizon_value(s: dict) -> str:
+        if s.get("n_scored", 0) == 0:
+            return "*no settled targets*"
+        return (f"**{s['total_points']} / {s['total_available']}** within ±1°F "
+                f"({s['hit_rate']:.0f}%)\nMAE {s['mae']:.1f}°F")
+
+    embed.add_field(name="⏱️ t+3h", value=horizon_value(s3), inline=True)
+    embed.add_field(name="⏱️ t+6h", value=horizon_value(s6), inline=True)
+    embed.set_footer(text="Ground truth: IEM ASOS · NWS CLI/DSM")
+    return embed
+
+
+async def post_daily_scorecard() -> None:
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        log.error("Guild %s not found", GUILD_ID)
+        return
+    channel = discord.utils.get(guild.text_channels, name=SCORE_CHANNEL_NAME)
+    if channel is None:
+        log.error("No #%s channel in %s", SCORE_CHANNEL_NAME, guild.name)
+        return
+
+    target_date = datetime.now(NY_TZ).date() - timedelta(days=1)
+    try:
+        data = await asyncio.to_thread(_compute_scorecard, target_date)
+    except Exception as exc:
+        log.warning("Scorecard compute failed for %s: %s", target_date, exc)
+        await channel.send(f"⚠️ Scorecard for {target_date} failed: `{exc}`")
+        return
+
+    if data.get("empty"):
+        await channel.send(
+            f"📊 No predictions were logged for {target_date} — bot may have been offline."
+        )
+        return
+    await channel.send(embed=build_scorecard_embed(data))
+    log.info("Posted scorecard for %s", target_date)
+
+
+@tasks.loop(time=SCORE_POST_TIME)
+async def scorecard_loop() -> None:
+    await post_daily_scorecard()
+
+
+@scorecard_loop.before_loop
+async def before_scorecard_loop() -> None:
+    await bot.wait_until_ready()
+    log.info("Scorecard loop armed — daily at %02d:%02d ET to #%s",
+             SCORE_POST_TIME.hour, SCORE_POST_TIME.minute, SCORE_CHANNEL_NAME)
 
 
 bot.run(DISCORD_TOKEN)
