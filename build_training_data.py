@@ -121,21 +121,15 @@ def fetch_in_chunks(station: str, start: datetime, end: datetime,
     cur = start
     while cur < end:
         nxt = min(cur + timedelta(days=chunk_days), end)
-        print(f"  [{station}] {cur.date()} → {nxt.date()}")
+        print(f"  [{station}] {cur.date()} -> {nxt.date()}")
         parts.append(fetch_iem_asos(station, cur, nxt, primary=primary))
         cur = nxt
     return pd.concat(parts, ignore_index=True).drop_duplicates("valid")
 
 
 # ── NWS CLI fetcher ─────────────────────────────────────────────────────────
-def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
-    """
-    Pull daily-max from the NWS Climate Daily Report (CLINYC) via IEM's
-    /api/1/nwstext endpoint. Returns DataFrame indexed by local_date with
-    a 'cli_max' column (°F).
-
-    CLI bulletins are issued in the evening for the prior day's totals;
-    midnight-LST max is the official daily high.
+def _fetch_cli_window(start: datetime, end: datetime) -> list[dict]:
+    """One CLINYC request over [start, end]; returns raw {local_date, cli_max}.
 
     Two IEM AFOS gotchas handled here:
       * retrieve.py defaults to limit=1 (newest bulletin only); an explicit
@@ -143,9 +137,7 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
       * The day-D final report is transmitted the morning of D+1, so its
         issuance-header date is a day ahead of the data — key off the
         "CLIMATE SUMMARY FOR <date>" line, not the header, or highs land on
-        the wrong date. Multiple issuances per date (preliminary + final) are
-        collapsed by keeping the max, so a partial-day preliminary can't
-        under-report a high that occurred after it was issued.
+        the wrong date.
     """
     ndays = (end - start).days + 4
     url = (
@@ -158,12 +150,11 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
     )
     resp = requests.get(url, timeout=180)
     resp.raise_for_status()
-    text = resp.text
 
     # Each bulletin contains a line like:
     #   "MAXIMUM         72   329 PM   71    78 2001   58"
     # The first integer after MAXIMUM is the daily high.
-    bulletins = re.split(r"\x01|000\s*\n", text)
+    bulletins = re.split(r"\x01|000\s*\n", resp.text)
     records = []
     for b in bulletins:
         date_m = re.search(r"CLIMATE SUMMARY FOR\s+(\w+\s+\d{1,2}\s+\d{4})", b)
@@ -175,9 +166,31 @@ def fetch_cli_max_temps(start: datetime, end: datetime) -> pd.DataFrame:
         except (ValueError, TypeError):
             continue
         records.append({"local_date": d, "cli_max": float(max_m.group(1))})
+    return records
+
+
+def fetch_cli_max_temps(start: datetime, end: datetime,
+                        chunk_days: int = 365) -> pd.DataFrame:
+    """
+    Daily-max from the NWS Climate Daily Report (CLINYC). Returns a DataFrame
+    with 'local_date' and 'cli_max' (°F), one row per date.
+
+    Chunked yearly to avoid the multi-MB single response (and server-side
+    timeout) that a decade-wide request would produce — a timeout here would
+    silently drop CLI entirely and fall back to the noisy METAR 6-hr max for
+    every day. Multiple issuances per date (preliminary + final) are collapsed
+    to the max so a partial-day preliminary can't under-report a later high.
+    """
+    records: list[dict] = []
+    cur = start
+    while cur < end:
+        nxt = min(cur + timedelta(days=chunk_days), end)
+        print(f"  [CLINYC] {cur.date()} -> {nxt.date()}")
+        records.extend(_fetch_cli_window(cur, nxt))
+        cur = nxt
 
     if not records:
-        print("  WARNING: no CLI records parsed — falling back to METAR 6h-max")
+        print("  WARNING: no CLI records parsed -- falling back to METAR 6h-max")
         return pd.DataFrame(columns=["local_date", "cli_max"])
 
     cli = (pd.DataFrame(records)
@@ -395,7 +408,7 @@ def main():
 
     print("Engineering features...")
     df = build_features(knyc, upstream, cli)
-    print(f"  -> {df.shape[0]:,} rows × {df.shape[1]} cols")
+    print(f"  -> {df.shape[0]:,} rows x {df.shape[1]} cols")
 
     df.to_csv(args.out, index=False)
     print(f"Wrote {args.out}")
