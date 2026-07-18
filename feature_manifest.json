@@ -70,18 +70,42 @@
     "KTEB_tmpf_delta",
     "KTEB_tmpf_tend_3h",
     "KTEB_sknt",
-    "KTEB_drct"
+    "KTEB_drct",
+    "KPHL_tmpf",
+    "KPHL_tmpf_delta",
+    "KPHL_tmpf_tend_3h",
+    "KPHL_sknt",
+    "KPHL_drct",
+    "KBWI_tmpf",
+    "KBWI_tmpf_delta",
+    "KBWI_tmpf_tend_3h",
+    "KBWI_sknt",
+    "KBWI_drct",
+    "KDCA_tmpf",
+    "KDCA_tmpf_delta",
+    "KDCA_tmpf_tend_3h",
+    "KDCA_sknt",
+    "KDCA_drct",
+    "KBOS_tmpf",
+    "KBOS_tmpf_delta",
+    "KBOS_tmpf_tend_3h",
+    "KBOS_sknt",
+    "KBOS_drct"
   ],
   "upstream_stations": [
     "KEWR",
     "KLGA",
     "KJFK",
-    "KTEB"
+    "KTEB",
+    "KPHL",
+    "KBWI",
+    "KDCA",
+    "KBOS"
   ],
   "train_through": "2021-12-31 23:51:00+00:00",
   "test_metrics": {
-    "daily_high_mae": 2.0459780827887024,
-    "t3h_mae": 1.2977359190108564,
-    "t6h_mae": 2.0656880405212235
+    "daily_high_mae": 1.9797284116180047,
+    "t3h_mae": 1.2968927710685523,
+    "t6h_mae": 2.0507320964402536
   }
 }

@@ -1,28 +1,52 @@
 # KNYC Temp Engine
 
-A machine-learning nowcasting system for Central Park, NYC (KNYC). It trains XGBoost models on KNYC ASOS observations plus upstream-station signal to predict short-term temperature and the day's high, then posts hourly forecasts to Discord.
+A machine-learning nowcasting system for Central Park, NYC (KNYC). It trains XGBoost models on KNYC ASOS observations plus upstream-station signal to predict short-term temperature and the day's high, then posts hourly forecasts to Discord. A separate scorer grades the bot's live predictions against settled ground truth.
 
 ## What it predicts
 
-| Model | Target | Test MAE |
-|---|---|---|
-| `knyc_model_daily_high.pkl` | NWS-settled daily high temperature | **2.05 °F** |
-| `knyc_model_t3h.pkl` | Temperature 3 hours ahead | **1.30 °F** |
-| `knyc_model_t6h.pkl` | Temperature 6 hours ahead | **2.07 °F** |
+| Model | Target | Test MAE | vs. persistence |
+|---|---|---|---|
+| `knyc_model_daily_high.pkl` | NWS-settled daily high temperature | **1.98 °F** | +3.71 °F better |
+| `knyc_model_t3h.pkl` | Temperature 3 hours ahead | **1.30 °F** | +1.39 °F better |
+| `knyc_model_t6h.pkl` | Temperature 6 hours ahead | **2.05 °F** | +2.72 °F better |
 
-Metrics are computed on a held-out test period after training through 2021-12-31, as recorded in [feature_manifest.json](feature_manifest.json).
+Trained on 2010–2021, validated on 2022–2023, tested on 2024 → present (~18k held-out hours). The daily-high model's warm bias is effectively eliminated (+0.05 °F on the test set). "Persistence" is the naive baseline of assuming no change (see [below](#baselines)). Exact feature list and metrics live in [feature_manifest.json](feature_manifest.json).
 
 ## How it works
 
-1. **[build_training_data.py](build_training_data.py)** pulls historical KNYC ASOS observations from IEM, along with upstream-station obs (KEWR, KLGA, KJFK, KTEB, KPHL, KBWI, KDCA, KBOS) for warm/cold-advection signal, and NWS Daily Climate Report (CLINYC) bulletins for the true settled daily high. It engineers features — wind u/v components, cloud oktas, solar zenith/altitude, pressure and temperature tendencies/lags/rolling stats, climatology anomaly — and writes `knyc_training.csv`.
-2. **[KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb)** trains the three XGBoost models on that data, evaluates them on the held-out test split, and exports the trained models plus [feature_manifest.json](feature_manifest.json) (the exact feature list and metrics the bot relies on).
-3. **[knyc_discord_bot.py](knyc_discord_bot.py)** runs continuously: every hour, it fetches the latest KNYC + upstream obs, re-engineers the same features used in training, runs all three models, and posts an embed to a `#predictions` Discord channel with the current conditions, t+3h/t+6h forecasts, model daily high, observed high so far, and a floor-locked "reassessed" high (the model's prediction can't go below what's already been observed). Predictions are logged to [nowcast_log.csv](nowcast_log.csv) for postmortem analysis.
+1. **[build_training_data.py](build_training_data.py)** pulls historical KNYC ASOS observations from the IEM archive, along with 8 upstream stations (KEWR, KLGA, KJFK, KTEB, KPHL, KBWI, KDCA, KBOS) for warm/cold-advection signal, and NWS Daily Climate Report (CLINYC) bulletins for the true settled daily high. It engineers features — wind u/v components, cloud oktas, solar zenith/altitude, pressure and temperature tendencies/lags/rolling stats, climatology anomaly, and per-station upstream deltas — and writes `knyc_training.csv` (untracked; regenerate locally).
+2. **[KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb)** trains the three XGBoost models on that data with time-aware splits and sample weighting toward recent years, evaluates them on the held-out test split against naive baselines, and exports the trained `.pkl` models plus [feature_manifest.json](feature_manifest.json) (the exact feature list, upstream stations, and metrics the bot relies on) and [tmpf_climatology.csv](tmpf_climatology.csv).
+3. **[knyc_discord_bot.py](knyc_discord_bot.py)** runs continuously: each hour it fetches the latest KNYC + upstream obs, re-engineers the same features used in training, runs all three models, and posts an embed to a `#predictions` Discord channel with current conditions, t+3h/t+6h forecasts, model daily high, observed high so far, and a floor-locked "reassessed" high (the prediction can't go below what's already been observed). Every prediction is logged to [nowcast_log.csv](nowcast_log.csv).
+4. **[score_predictions.py](score_predictions.py)** grades the logged predictions after the fact against settled ground truth (see [Scoring](#scoring-live-accuracy)).
 
 ## Data sources
 
-- **IEM ASOS** (`mesonet.agron.iastate.edu`) — hourly METAR observations for KNYC and upstream stations.
-- **NWS CLI bulletins** (CLINYC) — official settled daily high/low, used as the ground-truth training target where available, with a METAR-derived fallback.
-- [tmpf_climatology.csv](tmpf_climatology.csv) — per (month, hour) mean temperature baseline used to compute a temperature anomaly feature.
+- **aviationweather.gov** (FAA/NWS live METAR API) — the bot's real-time obs feed. A given hour's METAR is queryable within ~2 minutes of issuance, versus the IEM archive's inconsistent ingest lag.
+- **IEM ASOS archive** (`mesonet.agron.iastate.edu`) — settled historical hourly obs, used for training and as the scorer's ground-truth temperatures.
+- **NWS CLI bulletins** (CLINYC) — official settled daily high/low. The training target for the daily-high model (with a METAR 6-hr-max fallback), and the scorer's authoritative daily high + the time it occurred.
+- **ASOS DSM** (DSMNYC) — the raw ASOS daily summary max, used by the scorer as an independent cross-check on the CLI high.
+- [tmpf_climatology.csv](tmpf_climatology.csv) — per (month, hour) mean temperature baseline used to compute the temperature-anomaly feature.
+
+### Baselines
+
+The notebook reports each model against a **persistence** baseline — the naive "nothing changes" forecast:
+
+- **t+3h / t+6h persistence** = predict the temperature N hours from now equals the temperature *right now*. Beating it shows the model has learned real thermal evolution (diurnal cycle, advection, cloud/precip effects), not just inertia.
+- **Daily-high persistence** = predict today's high equals *yesterday's* high.
+
+A model is only useful insofar as it beats persistence; on the test set all three do, comfortably. Climatology (the seasonal-average high for the date) is reported as a second, weaker baseline for the daily-high model.
+
+## Scoring live accuracy
+
+[score_predictions.py](score_predictions.py) is a post-hoc scorer for the predictions in `nowcast_log.csv`. Run it after a test window to grade each model against settled ground truth:
+
+```
+python score_predictions.py                          # scores nowcast_log.csv
+python score_predictions.py --start 2026-07-20 --end 2026-08-03 --out score_out
+```
+
+- **Daily high** — scored only on predictions issued *before* the high actually occurred (afterward the obs-floor makes it trivially correct), using the official CLI high and its time. Reports MAE, hit-rates, a 0–100 skill score, and the issue-hours / lead-times where the model is most accurate.
+- **t+3h / t+6h** — scored out of 24 per NY-local day: 1 point per hourly prediction within ±1 °F of the actual temperature at the target time, plus MAE and best/worst hours.
 
 ## Setup
 
@@ -40,10 +64,10 @@ GUILD_ID=...
 ### Rebuild training data and retrain
 
 ```
-python build_training_data.py --start 2010-01-01 --end 2026-02-01
+python build_training_data.py --start 2010-01-01
 ```
 
-Then run [KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb) to retrain and regenerate the `.pkl` models and `feature_manifest.json`.
+This writes `knyc_training.csv` (gitignored). Then run [KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb) end-to-end to retrain and regenerate the three `.pkl` models, `feature_manifest.json`, and `tmpf_climatology.csv`. The bot loads all model artifacts from the repo root and reads the feature list / upstream stations from the manifest at startup, so a retrain with a changed feature set is picked up automatically.
 
 ### Run the bot
 
@@ -51,4 +75,4 @@ Then run [KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb) to retrain and regenerate 
 python knyc_discord_bot.py
 ```
 
-Posts one nowcast on startup, then every hour at :05 UTC (after the :51 METAR has had time to land in IEM), with retry on stale or missing observations.
+Posts one nowcast on startup, then every hour at **:55 UTC**. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick).

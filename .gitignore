@@ -1,0 +1,9 @@
+# Training data — large, regenerate with build_training_data.py
+knyc_training.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups / scratch
+*.bak
