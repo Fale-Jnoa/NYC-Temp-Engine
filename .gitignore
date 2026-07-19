@@ -1,5 +1,6 @@
 # Training data — large, regenerate with build_training_data.py
 knyc_training.csv
+.env
 
 # Python
 __pycache__/
@@ -7,3 +8,4 @@ __pycache__/
 
 # Backups / scratch
 *.bak
+.env
