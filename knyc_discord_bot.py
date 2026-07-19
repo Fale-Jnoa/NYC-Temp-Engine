@@ -141,10 +141,19 @@ def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
         clouds = r.get("clouds") or []
         wdir = r.get("wdir")
         temp_c, dewp_c = r.get("temp"), r.get("dewp")
+        # aviationweather has no humidity field; derive relh (%) from temp/dewp
+        # with the same Magnus coefficients engineer_features uses.
+        if temp_c is not None and dewp_c is not None:
+            a, b = 17.625, 243.04
+            relh = (100 * math.exp(a * dewp_c / (b + dewp_c))
+                    / math.exp(a * temp_c / (b + temp_c)))
+        else:
+            relh = np.nan
         rows.append({
             "valid": datetime.fromtimestamp(r["obsTime"], tz=timezone.utc),
             "tmpf": temp_c * 9 / 5 + 32 if temp_c is not None else np.nan,
             "dwpf": dewp_c * 9 / 5 + 32 if dewp_c is not None else np.nan,
+            "relh": relh,
             "drct": wdir if isinstance(wdir, (int, float)) else np.nan,
             "sknt": r.get("wspd", np.nan),
             "mslp": r.get("slp", np.nan),
@@ -160,7 +169,7 @@ def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
     df["valid"] = df["valid"].dt.floor("1h") + pd.Timedelta(minutes=51)
     df = df.drop_duplicates("valid", keep="last")
 
-    for col in ["tmpf", "dwpf", "drct", "sknt", "mslp", "p01i", "skyl1"]:
+    for col in ["tmpf", "dwpf", "relh", "drct", "sknt", "mslp", "p01i", "skyl1"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     for col, (lo, hi) in SANITY.items():
         if col in df.columns:
