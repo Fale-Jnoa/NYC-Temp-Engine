@@ -36,6 +36,7 @@ import os
 import re
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -106,6 +107,10 @@ SANITY = {"tmpf": (-30, 115), "dwpf": (-40, 90), "relh": (0, 100),
           "p01i": (0, 10), "feel": (-60, 130)}
 STALENESS_LIMIT = timedelta(minutes=90)
 AVWX_URL = "https://aviationweather.gov/api/data/metar"
+IEM_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+IEM_VARS = "tmpf,dwpf,relh,drct,sknt,mslp,p01i,skyc1,skyc2,skyc3,skyl1,metar"
+# If aviationweather's newest ob is older than this, fall back to / merge IEM.
+FALLBACK_STALE = timedelta(minutes=65)
 
 
 # ── aviationweather.gov fetch ───────────────────────────────────────────────
@@ -176,6 +181,95 @@ def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
             df.loc[(df[col] < lo) | (df[col] > hi), col] = np.nan
 
     return df.sort_values("valid").reset_index(drop=True)
+
+
+# ── IEM fallback fetch ──────────────────────────────────────────────────────
+def fetch_iem(station: str, hours_back: float) -> pd.DataFrame:
+    """IEM ASOS archive fallback, returning the same schema as fetch_avwx
+    (normalized to the :51 grid). IEM supplies relh directly. Used only when
+    the aviationweather feed is empty or hasn't ingested the latest ob yet."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours_back)
+    end = now + timedelta(hours=1)
+    params = {
+        "station": station, "data": IEM_VARS,
+        "year1": start.year, "month1": start.month, "day1": start.day, "hour1": start.hour,
+        "year2": end.year, "month2": end.month, "day2": end.day, "hour2": end.hour,
+        "tz": "UTC", "format": "comma", "latlon": "no", "elev": "no",
+        "missing": "M", "trace": "T", "direct": "no", "report_type": "3",
+        "_nocache": int(now.timestamp()),
+    }
+    for attempt in range(3):
+        resp = requests.get(params=params, url=IEM_URL, timeout=30,
+                            headers={"Cache-Control": "no-cache"})
+        if resp.status_code == 429:
+            time.sleep(5 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        break
+    else:
+        raise RuntimeError(f"IEM fetch failed for {station} after retries")
+
+    text = "\n".join(l for l in resp.text.splitlines()
+                     if not l.startswith("#") and l.strip())
+    if not text or "\n" not in text:
+        return pd.DataFrame()
+
+    df = pd.read_csv(StringIO(text))
+    df.columns = df.columns.str.strip()
+    if "valid" not in df.columns or df.empty:
+        return pd.DataFrame()
+    df["valid"] = pd.to_datetime(df["valid"]).dt.tz_localize("UTC")
+    df["valid"] = df["valid"].dt.floor("1h") + pd.Timedelta(minutes=51)
+    df = df.drop_duplicates("valid", keep="last")
+
+    for col in ["skyc1", "skyc2", "skyc3", "metar"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    for col in ["tmpf", "dwpf", "relh", "drct", "sknt", "mslp", "p01i", "skyl1"]:
+        df[col] = pd.to_numeric(df.get(col), errors="coerce")
+    for col, (lo, hi) in SANITY.items():
+        if col in df.columns:
+            df.loc[(df[col] < lo) | (df[col] > hi), col] = np.nan
+
+    keep = ["valid", "tmpf", "dwpf", "relh", "drct", "sknt", "mslp",
+            "p01i", "skyc1", "skyc2", "skyc3", "skyl1", "metar"]
+    return df[keep].sort_values("valid").reset_index(drop=True)
+
+
+def fetch_obs(station: str, hours_back: float) -> pd.DataFrame:
+    """aviationweather.gov primary; if it's empty or its newest ob is stale
+    (feed hasn't posted the latest hour yet), merge in IEM so the freshest
+    available ob wins. aviationweather values are preferred where both cover
+    the same timestamp."""
+    try:
+        df = fetch_avwx(station, hours_back)
+    except Exception as exc:
+        log.warning("aviationweather %s failed (%s) — falling back to IEM", station, exc)
+        df = pd.DataFrame()
+
+    if not df.empty:
+        age = datetime.now(timezone.utc) - df["valid"].iloc[-1].to_pydatetime()
+        if age <= FALLBACK_STALE:
+            return df
+        log.info("aviationweather %s latest ob %s old — supplementing with IEM", station, age)
+    else:
+        log.info("aviationweather %s returned nothing — falling back to IEM", station)
+
+    try:
+        iem = fetch_iem(station, hours_back)
+    except Exception as exc:
+        log.warning("IEM fallback %s failed: %s", station, exc)
+        iem = pd.DataFrame()
+
+    if iem.empty:
+        return df
+    if df.empty:
+        return iem
+    # Union of both; keep aviationweather's row when the timestamp collides.
+    merged = pd.concat([df, iem], ignore_index=True)
+    merged = merged.sort_values("valid").drop_duplicates("valid", keep="first")
+    return merged.reset_index(drop=True)
 
 
 # ── Parsing helpers ────────────────────────────────────────────────────────
@@ -309,6 +403,15 @@ def engineer_features(raw: pd.DataFrame, upstream: dict[str, pd.DataFrame]) -> p
                 columns={"tmpf": f"{code}_tmpf", "dwpf": f"{code}_dwpf",
                          "sknt": f"{code}_sknt", "drct": f"{code}_drct"})
             df = df.merge(u, on="valid", how="left")
+        # Bridge brief upstream gaps, then resolve variable/calm winds: a VRB ob
+        # carries a valid speed but no numeric direction, so {code}_drct is NaN.
+        # Left as-is it drops the whole current row via dropna() and can stall
+        # posting. ffill carries the last real value; drct then falls back to 0
+        # (matching KNYC's own calm/VRB -> u/v = 0 handling). A fully-down
+        # station still drops the row via its NaN temperature.
+        for suffix in ("tmpf", "dwpf", "sknt", "drct"):
+            df[f"{code}_{suffix}"] = df[f"{code}_{suffix}"].ffill(limit=3)
+        df[f"{code}_drct"] = df[f"{code}_drct"].fillna(0.0)
         df[f"{code}_tmpf_delta"] = df[f"{code}_tmpf"] - df["tmpf"]
         df[f"{code}_tmpf_tend_3h"] = df[f"{code}_tmpf"].diff(3)
 
@@ -347,14 +450,14 @@ def _apply_climatology(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Nowcast ────────────────────────────────────────────────────────────────
 def get_nowcast() -> dict:
-    raw = fetch_avwx(PRIMARY, hours_back=72)
+    raw = fetch_obs(PRIMARY, hours_back=72)
     if raw.empty:
-        raise RuntimeError("aviationweather.gov returned no KNYC obs")
+        raise RuntimeError("No KNYC obs from aviationweather.gov or IEM")
 
     upstream = {}
     for s in UPSTREAM:
         try:
-            upstream[s] = fetch_avwx(s, hours_back=72)
+            upstream[s] = fetch_obs(s, hours_back=72)
         except Exception as exc:
             log.warning("Upstream %s fetch failed: %s — proceeding with NaN", s, exc)
             upstream[s] = pd.DataFrame()
