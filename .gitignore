@@ -1,6 +1,12 @@
 # Training data — large, regenerate with build_training_data.py
 knyc_training.csv
+
+# Secrets
 .env
+
+# Runtime log — appended live by the bot; keep it per-host so `git pull`
+# on a deployed VM never conflicts with the local prediction history.
+nowcast_log.csv
 
 # Python
 __pycache__/
@@ -8,4 +14,3 @@ __pycache__/
 
 # Backups / scratch
 *.bak
-.env
