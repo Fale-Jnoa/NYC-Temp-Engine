@@ -352,10 +352,16 @@ def build_features(knyc: pd.DataFrame, upstream: dict[str, pd.DataFrame],
     df["target_t6h"] = df["tmpf"].shift(-6)
 
     # Daily high: prefer NWS CLI; fall back to max of (hourly tmpf, METAR 6h max).
+    # The 6-hr max group (00/06/12/18Z) covers the trailing 6 hours, which for
+    # early-morning obs straddles local midnight — its max can belong to the
+    # previous day, so only trust it when that window is fully inside the
+    # same local calendar day (see the identical guard in knyc_discord_bot.py).
     df["mxtmpf_6hr"] = df["metar"].apply(parse_6hr_max_from_metar) if "metar" in df.columns else np.nan
+    window_start_local = df["valid_local"] - pd.Timedelta(hours=6)
+    df["mxtmpf_6hr_sameday"] = df["mxtmpf_6hr"].where(window_start_local.dt.date == df["local_date"])
     fallback = (
         df.groupby("local_date")
-          .agg(hourly_max=("tmpf", "max"), six_hr_max=("mxtmpf_6hr", "max"))
+          .agg(hourly_max=("tmpf", "max"), six_hr_max=("mxtmpf_6hr_sameday", "max"))
           .max(axis=1)
           .rename("fallback_max")
     )

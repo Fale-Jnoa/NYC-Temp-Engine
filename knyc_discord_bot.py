@@ -497,7 +497,14 @@ def get_nowcast() -> dict:
     today_mask = df["local_date"] == today_local
     today_tmpf = df.loc[today_mask, "tmpf"].dropna()
     max_tmpf = float(today_tmpf.max()) if not today_tmpf.empty else None
-    today_mxt = df.loc[today_mask, "mxtmpf_6hr"].dropna()
+
+    # The METAR 6-hr max group (00/06/12/18Z) covers the trailing 6 hours, which
+    # for early-morning obs (e.g. ~06Z / 1:51am EDT) straddles local midnight —
+    # its max can reflect yesterday evening's warmth, not anything seen today.
+    # Only trust it when that window is fully inside today's local calendar day.
+    window_start_local = df["valid_local"] - pd.Timedelta(hours=6)
+    mxt_same_day_mask = today_mask & (window_start_local.dt.date == today_local)
+    today_mxt = df.loc[mxt_same_day_mask, "mxtmpf_6hr"].dropna()
     max_mxt = float(today_mxt.max()) if not today_mxt.empty else None
     candidates = [v for v in (max_tmpf, max_mxt) if v is not None]
     obs_high = max(candidates) if candidates else None
