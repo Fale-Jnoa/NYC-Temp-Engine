@@ -263,6 +263,14 @@ def build_daily_high(obs: pd.DataFrame, cli: pd.DataFrame, dsm: pd.DataFrame) ->
         fallback_vals = [v for v in (r.get("hourly_max"), r.get("sixhr_max")) if pd.notna(v)]
         fallback = max(fallback_vals) if fallback_vals else np.nan
 
+        # Kalshi settles KXHIGHNY on the NWS Climatological Report (Daily) alone.
+        # `actual_high` below blends CLI with DSM, which is the right call for
+        # measuring forecast accuracy but wrong for money: on a day the two
+        # differ by a degree the blend would book a win the exchange settled as
+        # a loss. `settle_high` is the exchange's number, and market_scorer.py
+        # uses it exclusively.
+        settle_high = float(cli) if pd.notna(cli) else np.nan
+
         if pd.notna(official):
             value = float(official)
             source = "CLI" if (pd.notna(cli) and cli >= (dsm if pd.notna(dsm) else -1e9)) else "DSM"
@@ -273,7 +281,8 @@ def build_daily_high(obs: pd.DataFrame, cli: pd.DataFrame, dsm: pd.DataFrame) ->
             value, source, htime = float(fallback), "hourly/6hr", r.get("hourly_time")
         else:
             return pd.Series({"actual_high": np.nan, "high_time": None,
-                              "high_source": None, "flag_gap": ""})
+                              "high_source": None, "flag_gap": "",
+                              "settle_high": settle_high})
 
         # Informative flags (do not change the value):
         flags = []
@@ -282,7 +291,8 @@ def build_daily_high(obs: pd.DataFrame, cli: pd.DataFrame, dsm: pd.DataFrame) ->
         if pd.notna(official) and pd.notna(r.get("hourly_max")) and official - r["hourly_max"] >= 1:
             flags.append(f"official>{r['hourly_max']:.0f} hourly by {official - r['hourly_max']:.0f}")
         return pd.Series({"actual_high": value, "high_time": htime,
-                          "high_source": source, "flag_gap": "; ".join(flags)})
+                          "high_source": source, "flag_gap": "; ".join(flags),
+                          "settle_high": settle_high})
 
     daily = pd.concat([daily, daily.apply(resolve, axis=1)], axis=1)
     return daily.sort_values("local_date").reset_index(drop=True)
