@@ -4,9 +4,11 @@ knyc_training.csv
 # Secrets
 .env
 
-# Runtime log — appended live by the bot; keep it per-host so `git pull`
+# Runtime logs — appended live by the bot; keep them per-host so `git pull`
 # on a deployed VM never conflicts with the local prediction history.
 nowcast_log.csv
+market_log.csv
+prediction_tape.csv
 
 # Python
 __pycache__/

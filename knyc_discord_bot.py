@@ -50,10 +50,16 @@ import discord
 from discord.ext import tasks
 
 import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
+import kalshi_market as km
+import prediction_tape as tape
 
 NY_TZ = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 LOG_PATH = HERE / "nowcast_log.csv"
+# Full Kalshi bracket ladder + prices, one row per contract per hour. Kept
+# separate from nowcast_log.csv (one row per hour) so the two stay joinable on
+# valid_t without either becoming ragged.
+MARKET_LOG_PATH = HERE / "market_log.csv"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -529,6 +535,26 @@ def get_nowcast() -> dict:
     except Exception as exc:
         log.warning("nowcast log write failed: %s", exc)
 
+    # Kalshi bracket prices at this exact hour. Historical prices cannot be
+    # recovered after the fact — the order book is gone once the event settles —
+    # so this snapshot is the only chance to capture them. Everything here is
+    # best-effort: a Kalshi outage must never stop a forecast from posting.
+    try:
+        brackets = km.fetch_brackets(today_local)
+        if brackets.empty:
+            log.info("no open Kalshi contracts for %s — skipping market log", today_local)
+        else:
+            problems = km.check_ladder(brackets)
+            if problems:
+                log.warning("Kalshi ladder looks wrong: %s", "; ".join(problems))
+            snap = brackets.copy()
+            snap.insert(0, "valid_t", valid_t.isoformat())
+            snap.to_csv(MARKET_LOG_PATH, mode="a",
+                        header=not MARKET_LOG_PATH.exists(), index=False)
+            tape.append_row(valid_t, pred_high, obs_high, reassessed, brackets)
+    except Exception as exc:
+        log.warning("market log write failed: %s", exc)
+
     return {
         "valid_t": valid_t,
         "cur_temp": cur_temp,
@@ -765,8 +791,12 @@ def build_scorecard_embed(data: dict) -> discord.Embed:
         plural = "s" if dh["n_eligible"] != 1 else ""
         embed.add_field(
             name="🌡️ Daily High Model",
+            # Labelled "±3°F skill", not bare "skill": it is a distance score
+            # (1.0 at 0°F decaying to 0 at 3°F), blind to where the Kalshi
+            # bracket boundaries fall. A correct contrarian bracket call can
+            # score mediocre here — see market_scorer.py for the money view.
             value=(f"MAE **{dh['mae']:.1f}°F** · within ±1°F: {dh['within_1']:.0f}% · "
-                   f"skill {dh['skill_pct']:.0f}/100\n"
+                   f"±3°F skill {dh['skill_pct']:.0f}/100\n"
                    f"Earliest call {pr['earliest_lead_h']:.1f}h out, "
                    f"off {pr['earliest_err']:.1f}°F\n"
                    f"*(scored on {dh['n_eligible']} pre-high forecast{plural})*"),
@@ -803,6 +833,17 @@ async def post_daily_scorecard() -> None:
         return
 
     target_date = datetime.now(NY_TZ).date() - timedelta(days=1)
+
+    # Settle the prediction tape. 6:30 AM is the first moment yesterday's CLI
+    # daily high is final, which is also what Kalshi settles on — so this is the
+    # right hour to stamp actual_high onto every row the bot wrote yesterday.
+    try:
+        n = await asyncio.to_thread(tape.backfill, verbose=False)
+        if n:
+            log.info("prediction tape: settled %d rows", n)
+    except Exception as exc:
+        log.warning("prediction tape backfill failed: %s", exc)
+
     try:
         data = await asyncio.to_thread(_compute_scorecard, target_date)
     except Exception as exc:
