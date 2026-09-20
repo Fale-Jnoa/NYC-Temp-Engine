@@ -68,6 +68,55 @@ logging.basicConfig(
 )
 log = logging.getLogger("knyc-nowcaster")
 
+
+def _last_log_line() -> str | None:
+    """The last data row already in the log, or None if the file is empty."""
+    try:
+        with open(LOG_PATH, "r", newline="") as fh:
+            last = None
+            for last in fh:
+                pass
+        return last.strip() if last else None
+    except OSError:
+        return None
+
+
+def _append_log_row(row: dict) -> None:
+    """Append one row to LOG_PATH, aligned to the file's existing header.
+
+    feature_manifest.json can gain or lose upstream stations between runs; a
+    plain mode="a" append would write the new column set under the stale
+    header, leaving a ragged CSV that pd.read_csv refuses to parse. Columns
+    the header has but this row lacks are written empty.
+
+    get_nowcast() runs on every poll — the 60s retries waiting for a late
+    METAR, and again on each Discord reconnect — so an unchanged row would
+    otherwise be logged ~50x an hour. The duplicate check compares against the
+    last line on disk rather than in-memory state, because systemd restarts
+    (Restart=always) and deploys would otherwise reset the guard and write a
+    duplicate on every boot. A retry that actually moved the prediction
+    (upstream obs landed mid-wait) still differs, so it is still written.
+    """
+    if not LOG_PATH.exists():
+        pd.DataFrame([row]).to_csv(LOG_PATH, index=False)
+        return
+
+    header = pd.read_csv(LOG_PATH, nrows=0).columns.tolist()
+    extra = [c for c in row if c not in header]
+    if extra:
+        log.warning("nowcast log header lacks %d current column(s), dropping: %s",
+                    len(extra), ", ".join(extra))
+
+    line = (pd.DataFrame([row]).reindex(columns=header)
+              .to_csv(header=False, index=False, lineterminator="\n").strip())
+    if line == _last_log_line():
+        log.debug("nowcast log row unchanged — skipping duplicate write")
+        return
+
+    with open(LOG_PATH, "a", newline="") as fh:
+        fh.write(line + "\n")
+
+
 # ── Credentials ────────────────────────────────────────────────────────────
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -529,9 +578,7 @@ def get_nowcast() -> dict:
                "valid_t": valid_t.isoformat(),
                "pred_high": pred_high, "pred_t3h": pred_t3h, "pred_t6h": pred_t6h,
                "obs_high": obs_high, "reassessed": reassessed}
-        pd.DataFrame([row]).to_csv(
-            LOG_PATH, mode="a", header=not LOG_PATH.exists(), index=False
-        )
+        _append_log_row(row)
     except Exception as exc:
         log.warning("nowcast log write failed: %s", exc)
 

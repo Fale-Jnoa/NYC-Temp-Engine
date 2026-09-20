@@ -10,6 +10,9 @@ nowcast_log.csv
 market_log.csv
 prediction_tape.csv
 
+# Nowcast analyizer
+analyze_nowcast_log.ipynb
+
 # Python
 __pycache__/
 *.pyc
