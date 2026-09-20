@@ -52,6 +52,7 @@ from discord.ext import tasks
 import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
 import kalshi_market as km
 import prediction_tape as tape
+import daily_chart
 
 NY_TZ = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
@@ -123,6 +124,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
 CHANNEL_NAME = "predictions"
 SCORE_CHANNEL_NAME = "score"
+# Discord lowercases channel names and turns spaces into hyphens, so the
+# channel created as "daily performance" resolves as "daily-performance".
+DAILY_PERF_CHANNEL_NAME = "daily-performance"
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN not set in .env")
@@ -143,6 +147,24 @@ if not manifest_path.exists():
 manifest = json.loads(manifest_path.read_text())
 FEATURE_COLS: list[str] = manifest["feature_cols"]
 UPSTREAM: list[str] = manifest["upstream_stations"]
+
+# Features derived from KNYC's own observation. These are the ones a forecast
+# cannot be made without — nothing can substitute for the station we predict.
+# Upstream-station features are deliberately excluded: the models are XGBoost,
+# which learns a branch direction for missing values and was trained with these
+# columns already NaN on some rows, so a dead upstream station costs accuracy
+# (~0.5F with three down) instead of blocking the post entirely.
+REQUIRED_FEATURE_COLS: list[str] = [
+    c for c in FEATURE_COLS
+    if not c.startswith(tuple(f"{s}_" for s in UPSTREAM))
+]
+
+# ...but only up to a point. Replaying the daily-high model over the log with
+# stations blanked shifts the prediction by a mean 1.1F with one station down,
+# 1.7F with two, and 3.2F with three — past the model's own 1.98F test MAE,
+# where the post stops being degraded and starts being misleading. Set to
+# len(UPSTREAM) to always post, or 0 for the old all-or-nothing behaviour.
+MAX_DEGRADED_UPSTREAM = 2
 
 for name, m in [("high", model_high), ("t3h", model_t3h), ("t6h", model_t6h)]:
     n_expected = getattr(m, "n_features_in_", None)
@@ -466,7 +488,11 @@ def engineer_features(raw: pd.DataFrame, upstream: dict[str, pd.DataFrame]) -> p
         # station still drops the row via its NaN temperature.
         for suffix in ("tmpf", "dwpf", "sknt", "drct"):
             df[f"{code}_{suffix}"] = df[f"{code}_{suffix}"].ffill(limit=3)
-        df[f"{code}_drct"] = df[f"{code}_drct"].fillna(0.0)
+        # Only resolve VRB/calm to 0 where the station actually reported. A
+        # fully-down station must stay NaN so XGBoost takes its learned missing
+        # branch rather than a fabricated "calm wind from due north".
+        reported = df[f"{code}_sknt"].notna()
+        df.loc[reported, f"{code}_drct"] = df.loc[reported, f"{code}_drct"].fillna(0.0)
         df[f"{code}_tmpf_delta"] = df[f"{code}_tmpf"] - df["tmpf"]
         df[f"{code}_tmpf_tend_3h"] = df[f"{code}_tmpf"].diff(3)
 
@@ -521,11 +547,11 @@ def get_nowcast() -> dict:
     df = engineer_features(raw, upstream)
     df = _apply_climatology(df)
 
-    ready = df.dropna(subset=FEATURE_COLS)
+    ready = df.dropna(subset=REQUIRED_FEATURE_COLS)
     if ready.empty:
         raise RuntimeError(
-            "Insufficient recent obs to fill all features. "
-            f"Latest row has missing: {df.iloc[-1][FEATURE_COLS].isna().sum()} cols."
+            "Insufficient recent KNYC obs to fill the required features. "
+            f"Latest row has missing: {df.iloc[-1][REQUIRED_FEATURE_COLS].isna().sum()} cols."
         )
 
     latest = ready.iloc[[-1]]
@@ -535,6 +561,20 @@ def get_nowcast() -> dict:
         raise RuntimeError(
             f"Latest usable obs is {age} old (>{STALENESS_LIMIT}). Refusing to post stale forecast."
         )
+
+    # Upstream stations are optional inputs; note which ones are absent so the
+    # post and the log both record that this forecast ran on partial data.
+    degraded = [s for s in UPSTREAM if pd.isna(latest[f"{s}_tmpf"].iloc[0])]
+    if len(degraded) > MAX_DEGRADED_UPSTREAM:
+        raise RuntimeError(
+            f"{len(degraded)}/{len(UPSTREAM)} upstream stations unavailable "
+            f"({', '.join(degraded)}) — more than MAX_DEGRADED_UPSTREAM="
+            f"{MAX_DEGRADED_UPSTREAM}. The daily-high prediction would shift by "
+            f"more than the model's own MAE. Refusing to post."
+        )
+    if degraded:
+        log.warning("Forecasting without %d/%d upstream station(s): %s",
+                    len(degraded), len(UPSTREAM), ", ".join(degraded))
 
     cur_temp = float(latest["tmpf"].iloc[0])
     cur_dwpf = float(latest["dwpf"].iloc[0])
@@ -614,6 +654,7 @@ def get_nowcast() -> dict:
         "pred_high": pred_high,
         "obs_high": obs_high,
         "reassessed": reassessed,
+        "degraded": degraded,
     }
 
 
@@ -668,7 +709,11 @@ def build_embed(data: dict) -> discord.Embed:
         value=f"**{data['reassessed']:.1f}°F**{obs_note}",
         inline=True,
     )
-    embed.set_footer(text="XGBoost · KNYC ASOS + upstream · aviationweather.gov · NWS CLI")
+    footer = "XGBoost · KNYC ASOS + upstream · aviationweather.gov · NWS CLI"
+    degraded = data.get("degraded") or []
+    if degraded:
+        footer += f"\n⚠️ {len(degraded)} upstream station(s) unavailable: {', '.join(degraded)}"
+    embed.set_footer(text=footer)
     return embed
 
 
@@ -806,6 +851,8 @@ def _compute_scorecard(target_date) -> dict:
         "dh": scorer.score_daily_high(preds, daily),
         "s3": scorer.score_horizon(preds, obs, 3, "pred_t3h"),
         "s6": scorer.score_horizon(preds, obs, 6, "pred_t6h"),
+        # Kept for the #daily-performance chart so it needs no second fetch.
+        "preds": preds, "obs": obs,
     }
 
 
@@ -905,6 +952,34 @@ async def post_daily_scorecard() -> None:
         return
     await channel.send(embed=build_scorecard_embed(data))
     log.info("Posted scorecard for %s", target_date)
+
+    await post_daily_performance(guild, target_date, data)
+
+
+async def post_daily_performance(guild, target_date, data: dict) -> None:
+    """Post the plain-language performance chart to #daily-performance.
+
+    Best-effort and self-contained: a rendering failure must not affect the
+    scorecard that has already gone out to #score.
+    """
+    channel = discord.utils.get(guild.text_channels, name=DAILY_PERF_CHANNEL_NAME)
+    if channel is None:
+        log.error("No #%s channel in %s — skipping performance chart",
+                  DAILY_PERF_CHANNEL_NAME, guild.name)
+        return
+
+    drow = data.get("daily_row") or {}
+    actual_high = drow.get("actual_high")
+    try:
+        path = await asyncio.to_thread(
+            daily_chart.render, target_date, data["preds"], data["obs"],
+            actual_high, HERE / "daily_chart.png",
+        )
+        await channel.send(file=discord.File(path, filename="daily_performance.png"))
+        log.info("Posted performance chart for %s", target_date)
+    except Exception as exc:
+        log.warning("Performance chart failed for %s: %s", target_date, exc)
+        await channel.send(f"⚠️ Performance chart for {target_date} failed: `{exc}`")
 
 
 @tasks.loop(time=SCORE_POST_TIME)

@@ -13,6 +13,9 @@ prediction_tape.csv
 # Nowcast analyizer
 analyze_nowcast_log.ipynb
 
+# Rendered each morning for #daily-performance; regenerated, never edited.
+daily_chart.png
+
 # Python
 __pycache__/
 *.pyc
