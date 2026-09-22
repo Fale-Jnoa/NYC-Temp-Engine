@@ -752,7 +752,11 @@ async def post_nowcast_to_channel(*, wait_for_fresh: bool = False) -> None:
     while True:
         attempt += 1
         try:
-            data = get_nowcast()
+            # In a worker thread: get_nowcast() blocks for 10-40s (9 HTTP
+            # fetches, their sleeps, and model inference). On the event loop it
+            # starves the gateway heartbeat, which makes Discord drop the
+            # connection and forces a RESUME every cycle.
+            data = await asyncio.to_thread(get_nowcast)
             stale = (
                 wait_for_fresh
                 and last_posted_valid is not None
@@ -971,11 +975,10 @@ async def post_daily_performance(guild, target_date, data: dict) -> None:
     drow = data.get("daily_row") or {}
     actual_high = drow.get("actual_high")
     try:
-        path = await asyncio.to_thread(
-            daily_chart.render, target_date, data["preds"], data["obs"],
-            actual_high, HERE / "daily_chart.png",
+        png = await asyncio.to_thread(
+            daily_chart.render, target_date, data["preds"], data["obs"], actual_high,
         )
-        await channel.send(file=discord.File(path, filename="daily_performance.png"))
+        await channel.send(file=discord.File(png, filename="daily_performance.png"))
         log.info("Posted performance chart for %s", target_date)
     except Exception as exc:
         log.warning("Performance chart failed for %s: %s", target_date, exc)

@@ -12,13 +12,17 @@ Written for a general audience, so it avoids MAE/bias/skill language entirely an
 states the outcome in a sentence. Uses the Agg backend because the deploy target
 is a headless VM with no display.
 
+`render` returns the PNG in memory; the bot uploads it straight to Discord and
+nothing is written to disk. Only the manual command below saves a file.
+
 Usage
 -----
-    python daily_chart.py               # yesterday, writes daily_chart.png
+    python daily_chart.py               # yesterday, saves daily_chart.png to preview
     python daily_chart.py 2026-09-06
 """
 from __future__ import annotations
 
+import io
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -53,16 +57,14 @@ def _clock(h: float) -> str:
 
 
 def render(target_date: date, preds: pd.DataFrame, obs: pd.DataFrame,
-           actual_high: float | None, out_path: Path | str) -> Path:
-    """Draw the day's chart to `out_path` and return it.
+           actual_high: float | None) -> io.BytesIO:
+    """Draw the day's chart and return it as an in-memory PNG, rewound to the start.
 
     preds  rows from nowcast_log.csv for this NY-local date (needs local_hour,
            pred_high; tmpf is used only if `obs` is unusable).
     obs    hourly observations covering the day (needs valid, tmpf), used for the
            temperature curve so it stays continuous even across bot downtime.
     """
-    out_path = Path(out_path)
-
     p = preds.dropna(subset=["pred_high"]).sort_values("local_hour")
     pred_hours = p["local_hour"].to_numpy(dtype=float)
     pred_vals = p["pred_high"].to_numpy(dtype=float)
@@ -137,9 +139,11 @@ def render(target_date: date, preds: pd.DataFrame, obs: pd.DataFrame,
               labelcolor=INK, columnspacing=1.8)
 
     fig.tight_layout()
-    fig.savefig(out_path, facecolor=SURFACE, bbox_inches="tight")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
-    return out_path
+    buf.seek(0)
+    return buf
 
 
 def _temperature_curve(target_date: date, preds: pd.DataFrame,
@@ -206,7 +210,8 @@ def main() -> None:
     drow = daily[daily["local_date"] == target]
     actual = float(drow.iloc[0]["actual_high"]) if not drow.empty else None
 
-    out = render(target, preds, obs, actual, HERE / "daily_chart.png")
+    out = HERE / "daily_chart.png"
+    out.write_bytes(render(target, preds, obs, actual).getvalue())
     print(f"wrote {out}")
 
 
