@@ -12,22 +12,25 @@ can score mediocre.
 
 What it reports
 ---------------
-1. REBALANCED ROI (primary) — hold a position, re-price every hour, and pay the
-   spread every time the model changes its mind. This is the only accounting
-   that charges for mid-day flip-flopping.
-2. FLAT ROI (baseline) — one independent 1-unit bet per hour, no position
-   tracking. The GAP between this and (1) is the cost of the model's
-   instability: flat +40% / rebalanced -5% means the signal is real but
-   untradeable.
-3. BRIER, model vs market — a proper scoring rule over the bracket ladder.
-   Thousands of comparisons per fortnight instead of ~14 settled bets, so it
-   converges while ROI is still noise.
+1. REBALANCED ROI — hold a position, re-price every hour, and pay the spread
+   every time the model changes its mind.
+2. FLAT ROI — one independent 1-unit bet per hour on the best-edge contract,
+   net of fees, next to the MARKET-FAVOURITE baseline (buy the highest-mid
+   contract every hour). A model that cannot beat "buy the favourite" has no
+   edge, whatever its own ROI says.
+3. MODEL vs FAVOURITE — the hours where the model's top bracket differs from
+   the market's, and who was right. This is where any edge has to come from.
+4. BRIER, model vs market, overall and by hour block — a proper scoring rule
+   over the ladder. Converges far faster than ROI.
+
+All confidence intervals resample whole days: hours within a day share one
+settlement, so a per-bet bootstrap would be several times too narrow.
 
 Inputs
 ------
     market_log.csv     bracket ladder + prices, per hour   (written by the bot)
     nowcast_log.csv    pred_high / obs_high, per hour      (written by the bot)
-    residual_model.csv residual distribution               (build_residuals.py)
+    offset_pmf.csv     observation-conditioned offset PMF  (build_residuals.py)
 Ground truth is the CLI daily high — the same NWS Climatological Report the
 exchange settles on.
 
@@ -48,15 +51,16 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+import kalshi_market as km
 import score_predictions as sp
-from build_residuals import QUANTILES, SEASON
+from build_residuals import K_COLS, K_MAX, K_MIN, gap_bucket
 
 NY_TZ = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 
 MARKET_LOG = HERE / "market_log.csv"
 NOWCAST_LOG = HERE / "nowcast_log.csv"
-RESIDUAL_MODEL = HERE / "residual_model.csv"
+OFFSET_PMF = HERE / "offset_pmf.csv"
 
 # Strategy defaults (sweepable — see --sweep).
 EDGE_THRESHOLD = 0.05   # minimum model_prob - ask before any interest
@@ -67,83 +71,60 @@ FEE_RATE = 0.07         # Kalshi trading fee coefficient: rate * C * P * (1-P)
 
 
 # ── Probability model ───────────────────────────────────────────────────────
-class ResidualCDF:
-    """Empirical CDF of the daily-high residual, binned by (season, local_hour).
-
-    Built from `residual_model.csv`. Bins fall back to the pooled all-hours row
-    when a specific (season, hour) bin was too sparse to persist.
-    """
+class OffsetPMF:
+    """P(settlement - round(re) = k), by NY-local hour and model-minus-observed
+    gap (see build_residuals.py). Falls back to the hour's pooled row when an
+    (hour, gap) cell was too sparse to persist, or when there is no obs yet."""
 
     def __init__(self, table: pd.DataFrame):
-        self.qcols = [f"q{int(q * 1000):04d}" for q in QUANTILES]
-        self.probs = np.array(QUANTILES, dtype=float)
-        self.bins: dict[tuple[str, int], np.ndarray] = {}
-        self.stats: dict[tuple[str, int], tuple[float, float]] = {}
+        self.ks = np.arange(K_MIN, K_MAX + 1)
+        self.cells: dict[tuple[int, str], np.ndarray] = {}
         for _, r in table.iterrows():
-            key = (str(r["season"]), int(r["local_hour"]))
-            self.bins[key] = r[self.qcols].to_numpy(dtype=float)
-            self.stats[key] = (float(r["mean"]), float(r["std"]))
-        if ("ALL", -1) not in self.bins:
-            raise SystemExit("residual_model.csv is missing the pooled ('ALL', -1) row")
+            w = r[K_COLS].to_numpy(dtype=float)
+            self.cells[(int(r["local_hour"]), str(r["gap_bucket"]))] = w / w.sum()
+        missing = [h for h in range(24) if (h, "ALL") not in self.cells]
+        if missing:
+            raise SystemExit(f"offset_pmf.csv lacks pooled rows for hours {missing}")
 
-    def _lookup(self, season: str, hour: int) -> tuple[np.ndarray, tuple[float, float]]:
-        for key in ((season, hour), ("ALL", hour), ("ALL", -1)):
-            if key in self.bins:
-                return self.bins[key], self.stats[key]
-        raise KeyError(season, hour)  # unreachable: ('ALL', -1) is guaranteed
+    def lookup(self, hour: int, gap: str | None) -> np.ndarray:
+        return self.cells.get((hour, gap)) if gap is not None and (hour, gap) in self.cells \
+            else self.cells[(hour, "ALL")]
 
-    def cdf(self, x: float, center: float, season: str, hour: int) -> float:
-        """P(daily high <= x) given a point prediction `center`."""
-        if math.isinf(x):
-            return 0.0 if x < 0 else 1.0
-        q, (mean, std) = self._lookup(season, hour)
-        # Pad with wide normal-ish tails so extreme brackets get small but
-        # non-zero mass; clamping to the 1st/99th pctile would assign an
-        # impossible-outcome probability of exactly 0 and make any loss there
-        # look like a free bet.
-        std = std if std and not math.isnan(std) else 1.0
-        xp = np.concatenate(([mean - 4 * std], q, [mean + 4 * std]))
-        fp = np.concatenate(([0.0005], self.probs, [0.9995]))
-        order = np.argsort(xp)
-        return float(np.clip(np.interp(x - center, xp[order], fp[order]), 0.0, 1.0))
+
+def _isnan(x) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
 def bracket_probs(ladder: pd.DataFrame, pred_high: float, obs_high: float | None,
-                  season: str, hour: int, rcdf: ResidualCDF) -> np.ndarray:
+                  hour: int, pmf: OffsetPMF) -> np.ndarray:
     """P(settlement lands in each contract's interval).
 
-    Two corrections that materially change the numbers:
-
-    * Continuity: the CLI reports a whole degree, so a "89 to 90" contract pays
-      on {89, 90} and its probability is F(90.5) - F(88.5). Dropping the half
-      degree misprices every boundary bracket.
-    * Obs floor: the day's high cannot come in below what has already been
-      observed. Mass below `obs_high` is zeroed and the rest renormalized. The
-      distribution is centered on max(pred, obs_high) — once the observed high
-      exceeds the model's call, the model is known-wrong low and the observation
-      is the better point estimate (this is the bot's own `reassessed` logic).
+    Centred on re = max(pred, obs) rounded half-up, with the offset k drawn from
+    the PMF for this hour and how far the model sits above the observed high.
+    Each outcome is floored at the rounded observed high (the day cannot settle
+    below what has been seen). A small uniform floor (0.002) keeps every
+    contract possible, so a loss is never priced as impossible.
     """
-    center = pred_high if obs_high is None or math.isnan(obs_high) else max(pred_high, obs_high)
+    obs = None if _isnan(obs_high) else float(obs_high)
+    re = pred_high if obs is None else max(pred_high, obs)
+    base = km.round_half_up(re)
+    floor_int = km.round_half_up(obs) if obs is not None else None
+    w = pmf.lookup(hour, gap_bucket(None if obs is None else pred_high - obs))
+
     lo = ladder["lo"].to_numpy(dtype=float)
     hi = ladder["hi"].to_numpy(dtype=float)
-
-    upper = np.array([rcdf.cdf(h + 0.5, center, season, hour) for h in hi])
-    lower = np.array([rcdf.cdf(l - 0.5, center, season, hour) for l in lo])
-    p = np.clip(upper - lower, 0.0, None)
-
-    if obs_high is not None and not math.isnan(obs_high):
-        floor = float(obs_high)
-        # Kill any bracket that tops out below the observed high, and clip the
-        # one bracket that straddles it down to its surviving upper piece.
-        floor_cdf = rcdf.cdf(floor - 0.5, center, season, hour)
-        p[hi < floor] = 0.0
-        straddle = (lo <= floor) & (hi >= floor)
-        if straddle.any():
-            surviving = np.clip(upper - np.maximum(lower, floor_cdf), 0.0, None)
-            p[straddle] = surviving[straddle]
-
-    total = p.sum()
-    return p / total if total > 0 else np.full(len(p), 1.0 / len(p))
+    p = np.zeros(len(ladder))
+    for k, wk in zip(pmf.ks, w):
+        if wk <= 0:
+            continue
+        v = base + int(k)
+        if floor_int is not None:
+            v = max(v, floor_int)
+        idx = np.flatnonzero((lo <= v) & (v <= hi))
+        if idx.size:
+            p[idx[0]] += wk
+    p += 0.002
+    return p / p.sum()
 
 
 # ── Fees ────────────────────────────────────────────────────────────────────
@@ -172,16 +153,18 @@ def load_joined(market_log: Path, nowcast_log: Path) -> pd.DataFrame:
 
     mk["valid_utc"] = pd.to_datetime(mk["valid_t"], utc=True)
     nc["valid_utc"] = pd.to_datetime(nc["valid_t"], utc=True)
-    nc = nc.drop_duplicates("valid_utc", keep="last")[
+    # keep="first": the first write is what existed when the forecast was
+    # posted. Pre-2026-11 logs re-polled some hours; the later rows carry
+    # prices and predictions from after the posted moment (look-ahead).
+    nc = nc.drop_duplicates("valid_utc", keep="first")[
         ["valid_utc", "pred_high", "obs_high", "reassessed"]
     ]
-    mk = mk.drop_duplicates(["valid_utc", "ticker"], keep="last")
+    mk = mk.drop_duplicates(["valid_utc", "ticker"], keep="first")
 
     df = mk.merge(nc, on="valid_utc", how="inner")
     df["valid_local"] = df["valid_utc"].dt.tz_convert(NY_TZ)
     df["local_date"] = df["valid_local"].dt.date
     df["local_hour"] = df["valid_local"].dt.hour
-    df["season"] = df["valid_local"].dt.month.map(SEASON)
     return df.sort_values(["valid_utc", "lo"]).reset_index(drop=True)
 
 
@@ -203,7 +186,7 @@ def settlement_truth(dates: list, verbose: bool = True) -> dict:
 
 
 # ── Strategies ──────────────────────────────────────────────────────────────
-def run_rebalanced(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
+def run_rebalanced(df: pd.DataFrame, truth: dict, pmf: OffsetPMF, *,
                    kelly: float = KELLY_MULT, band: float = NO_TRADE_BAND,
                    thresh: float = EDGE_THRESHOLD, fee_rate: float = FEE_RATE,
                    bankroll: float = 1000.0) -> dict:
@@ -222,8 +205,8 @@ def run_rebalanced(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
         for _, hour_rows in day_rows.groupby("valid_utc"):
             ladder = hour_rows.reset_index(drop=True)
             p = bracket_probs(ladder, ladder["pred_high"].iloc[0],
-                              ladder["obs_high"].iloc[0], ladder["season"].iloc[0],
-                              int(ladder["local_hour"].iloc[0]), rcdf)
+                              ladder["obs_high"].iloc[0],
+                              int(ladder["local_hour"].iloc[0]), pmf)
 
             # Mark to market on the bid (what the position could be sold for).
             held = sum(positions.get(t, 0.0) * b
@@ -305,7 +288,7 @@ def run_rebalanced(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
     return out
 
 
-def run_flat(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
+def run_flat(df: pd.DataFrame, truth: dict, pmf: OffsetPMF, *,
              thresh: float = EDGE_THRESHOLD) -> dict:
     """One independent 1-unit bet per hour on the single best-edge contract."""
     recs = []
@@ -314,8 +297,8 @@ def run_flat(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
             continue
         ladder = hour_rows.reset_index(drop=True)
         p = bracket_probs(ladder, ladder["pred_high"].iloc[0],
-                          ladder["obs_high"].iloc[0], ladder["season"].iloc[0],
-                          int(ladder["local_hour"].iloc[0]), rcdf)
+                          ladder["obs_high"].iloc[0],
+                          int(ladder["local_hour"].iloc[0]), pmf)
         tradeable = [(p[i] - r["yes_ask"], i) for i, r in ladder.iterrows()
                      if 0 < r["yes_ask"] < 1.0]
         if not tradeable:
@@ -324,13 +307,21 @@ def run_flat(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
         if edge <= thresh:
             continue
         row = ladder.iloc[i]
-        win = bool(row["lo"] <= truth[day] <= row["hi"])
-        recs.append({
-            "local_date": day, "local_hour": int(row["local_hour"]),
-            "ticker": row["ticker"], "ask": row["yes_ask"], "model_p": p[i],
-            "edge": edge, "win": win,
-            "pnl": (1.0 / row["yes_ask"] - 1.0) if win else -1.0,
-        })
+        recs.append(_flat_bet(day, row, truth[day], model_p=p[i], edge=edge))
+    return _flat_summary(recs)
+
+
+def _flat_bet(day, row, actual: float, **extra) -> dict:
+    """$1 bought at the ask, net of the Kalshi fee on 1/ask contracts."""
+    ask = float(row["yes_ask"])
+    win = bool(row["lo"] <= actual <= row["hi"])
+    fee = kalshi_fee(1.0 / ask, ask)
+    return {"local_date": day, "local_hour": int(row["local_hour"]),
+            "ticker": row["ticker"], "ask": ask, "win": win,
+            "pnl": ((1.0 / ask - 1.0) if win else -1.0) - fee, **extra}
+
+
+def _flat_summary(recs: list[dict]) -> dict:
     r = pd.DataFrame(recs)
     if r.empty:
         return {"n_bets": 0}
@@ -340,7 +331,45 @@ def run_flat(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF, *,
             "mean_ask": float(r["ask"].mean()), "bets": r}
 
 
-def brier_scores(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF) -> dict:
+def run_favourite(df: pd.DataFrame, truth: dict) -> dict:
+    """Baseline: every hour, $1 on the contract with the highest mid price."""
+    recs = []
+    for (day, _), hour_rows in df.groupby(["local_date", "valid_utc"]):
+        if day not in truth:
+            continue
+        ladder = hour_rows.reset_index(drop=True)
+        mid = (ladder["yes_bid"] + ladder["yes_ask"]) / 2.0
+        row = ladder.loc[mid.idxmax()]
+        if not (0 < row["yes_ask"] < 1.0):
+            continue
+        recs.append(_flat_bet(day, row, truth[day]))
+    return _flat_summary(recs)
+
+
+def model_vs_favourite(df: pd.DataFrame, truth: dict, pmf: OffsetPMF) -> dict:
+    """Hours where the model's most likely bracket is not the market favourite."""
+    agree = disagree = model_right = fav_right = 0
+    for (day, _), hour_rows in df.groupby(["local_date", "valid_utc"]):
+        if day not in truth:
+            continue
+        ladder = hour_rows.reset_index(drop=True)
+        p = bracket_probs(ladder, ladder["pred_high"].iloc[0], ladder["obs_high"].iloc[0],
+                          int(ladder["local_hour"].iloc[0]), pmf)
+        mid = ((ladder["yes_bid"] + ladder["yes_ask"]) / 2.0).to_numpy()
+        m_i, f_i = int(np.argmax(p)), int(np.argmax(mid))
+        if m_i == f_i:
+            agree += 1
+            continue
+        disagree += 1
+        a = truth[day]
+        model_right += bool(ladder.at[m_i, "lo"] <= a <= ladder.at[m_i, "hi"])
+        fav_right += bool(ladder.at[f_i, "lo"] <= a <= ladder.at[f_i, "hi"])
+    return {"agree": agree, "disagree": disagree,
+            "model_right_pct": model_right / disagree * 100 if disagree else math.nan,
+            "fav_right_pct": fav_right / disagree * 100 if disagree else math.nan}
+
+
+def brier_scores(df: pd.DataFrame, truth: dict, pmf: OffsetPMF) -> dict:
     """Multi-class Brier for model vs market, over the mutually-exclusive ladder.
 
     Market probabilities are mid prices normalized to sum to 1, which strips the
@@ -353,8 +382,8 @@ def brier_scores(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF) -> dict:
             continue
         ladder = hour_rows.reset_index(drop=True)
         p = bracket_probs(ladder, ladder["pred_high"].iloc[0],
-                          ladder["obs_high"].iloc[0], ladder["season"].iloc[0],
-                          int(ladder["local_hour"].iloc[0]), rcdf)
+                          ladder["obs_high"].iloc[0],
+                          int(ladder["local_hour"].iloc[0]), pmf)
         mid = ((ladder["yes_bid"] + ladder["yes_ask"]) / 2.0).to_numpy()
         if mid.sum() <= 0:
             continue
@@ -370,24 +399,49 @@ def brier_scores(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF) -> dict:
         return {"n": 0}
     return {"n": len(b), "model": float(b["model"].mean()),
             "market": float(b["market"].mean()),
-            "by_hour": b.groupby("local_hour")[["model", "market"]].mean().reset_index()}
+            "by_hour": (b.groupby("local_hour")
+                          .agg(n=("model", "size"), model=("model", "mean"),
+                               market=("market", "mean"))
+                          .reset_index())}
 
 
-def bootstrap_ci(values: np.ndarray, n_boot: int = 5000, seed: int = 0) -> tuple[float, float]:
-    """Percentile CI for a mean. With ~10:1 payoffs this is usually humbling."""
-    if len(values) < 2:
+def bootstrap_ci(bets: pd.DataFrame, n_boot: int = 5000, seed: int = 0) -> tuple[float, float]:
+    """95% CI for mean P&L per bet, resampling whole days (cluster bootstrap).
+
+    Bets within a day share one settlement and are strongly correlated; a
+    per-bet bootstrap treats them as independent and is far too narrow."""
+    by_day = bets.groupby("local_date")["pnl"].agg(["sum", "count"])
+    if len(by_day) < 2:
         return (math.nan, math.nan)
     rng = np.random.default_rng(seed)
-    means = rng.choice(values, size=(n_boot, len(values)), replace=True).mean(axis=1)
+    sums, counts = by_day["sum"].to_numpy(), by_day["count"].to_numpy()
+    idx = rng.integers(0, len(by_day), size=(n_boot, len(by_day)))
+    means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
 # ── Report ──────────────────────────────────────────────────────────────────
-def print_report(reb: dict, flat: dict, brier: dict, df: pd.DataFrame) -> None:
+HOUR_BLOCKS = [(0, 5), (6, 9), (10, 12), (13, 15), (16, 18), (19, 23)]
+
+
+def _print_flat(label: str, flat: dict) -> tuple[float, float] | None:
+    if flat.get("n_bets", 0) == 0:
+        print(f"  {label:<11}: no bets")
+        return None
+    lo, hi = bootstrap_ci(flat["bets"])
+    print(f"  {label:<11}: {flat['n_bets']:>5} bets  hit {flat['hit_pct']:>3.0f}%  "
+          f"mean ask {flat['mean_ask']:.2f}  ROI {flat['roi_pct']:+6.1f}%  "
+          f"95% CI [{lo * 100:+.0f}%, {hi * 100:+.0f}%]")
+    return lo, hi
+
+
+def print_report(reb: dict, flat: dict, fav: dict, vs: dict, brier: dict,
+                 df: pd.DataFrame) -> None:
     line = "=" * 70
     print(f"\n{line}\nKNYC NOWCASTER -- MARKET-RELATIVE SCORECARD\n{line}")
     days = df["local_date"].nunique()
     print(f"Hours scored: {df['valid_utc'].nunique()}  |  days: {days}")
+    print("CIs resample whole days. With this few days, ROI is mostly noise.")
 
     print(f"\n{'-' * 70}\n1. REBALANCED  (position held, spread paid on every change of mind)\n{'-' * 70}")
     print(f"  Bankroll   : {reb['start']:,.0f} -> {reb['final']:,.2f}")
@@ -398,42 +452,51 @@ def print_report(reb: dict, flat: dict, brier: dict, df: pd.DataFrame) -> None:
     print(f"  Cost of trading: ${reb['spread_paid']:,.2f} spread + "
           f"${reb['fees_paid']:,.2f} fees")
 
-    print(f"\n{'-' * 70}\n2. FLAT BASELINE  (1 unit/hour, no position tracking)\n{'-' * 70}")
-    if flat.get("n_bets", 0) == 0:
-        print("  No bets cleared the edge threshold.")
+    print(f"\n{'-' * 70}\n2. FLAT, NET OF FEES  (1 unit/hour at the ask)\n{'-' * 70}")
+    ci = _print_flat("Model edge", flat)
+    _print_flat("Favourite", fav)
+    if ci is not None:
+        if ci[0] > 0:
+            print("  ^ model CI is above zero")
+        elif ci[1] < 0:
+            print("  ^ model CI is below zero: the edge bets lose money")
+        else:
+            print("  ^ model CI spans zero: not distinguishable from luck")
+
+    print(f"\n{'-' * 70}\n3. MODEL vs MARKET FAVOURITE\n{'-' * 70}")
+    if vs["disagree"]:
+        print(f"  Agree {vs['agree']} hours, disagree {vs['disagree']} hours. When they disagree:")
+        print(f"    model's bracket right {vs['model_right_pct']:.0f}%   "
+              f"favourite right {vs['fav_right_pct']:.0f}%")
     else:
-        lo, hi = bootstrap_ci(flat["bets"]["pnl"].to_numpy())
-        print(f"  Bets       : {flat['n_bets']}   hit rate {flat['hit_pct']:.0f}%   "
-              f"mean ask {flat['mean_ask']:.2f}")
-        print(f"  ROI        : {flat['roi_pct']:+.1f}%   "
-              f"95% CI [{lo * 100:+.0f}%, {hi * 100:+.0f}%]")
-        if lo < 0 < hi:
-            print("               ^ CI spans zero: not yet distinguishable from luck")
+        print(f"  Model and favourite agreed on all {vs['agree']} hours.")
 
-    if flat.get("n_bets", 0) and "roi_pct" in reb:
-        gap = flat["roi_pct"] - reb["roi_pct"]
-        print(f"\n  >> COST OF INSTABILITY: {gap:+.1f} pts "
-              f"(flat {flat['roi_pct']:+.1f}% vs rebalanced {reb['roi_pct']:+.1f}%)")
-        if gap > 15:
-            print("     Signal is real but the model changes its mind too often to trade.")
-
-    print(f"\n{'-' * 70}\n3. BRIER  (lower is better; converges faster than ROI)\n{'-' * 70}")
+    print(f"\n{'-' * 70}\n4. BRIER  (lower is better; uniform over 6 brackets = 0.833)\n{'-' * 70}")
     if brier.get("n", 0) == 0:
         print("  Not enough settled ladder-hours.")
     else:
         verdict = "MODEL" if brier["model"] < brier["market"] else "MARKET"
-        print(f"  n={brier['n']}   model {brier['model']:.4f} vs "
-              f"market {brier['market']:.4f}   -> {verdict} better calibrated")
+        print(f"  all hours  n={brier['n']:>5}  model {brier['model']:.3f}  "
+              f"market {brier['market']:.3f}  -> {verdict} better")
+        bh = brier["by_hour"]
+        for a, b in HOUR_BLOCKS:
+            g = bh[(bh["local_hour"] >= a) & (bh["local_hour"] <= b)]
+            if g.empty:
+                continue
+            n = int(g["n"].sum())
+            m = float((g["model"] * g["n"]).sum() / n)
+            k = float((g["market"] * g["n"]).sum() / n)
+            print(f"  {a:02d}-{b:02d}h    n={n:>5}  model {m:.3f}  market {k:.3f}")
 
     if not reb["per_day"].empty:
-        print(f"\n{'-' * 70}\nPER-DAY\n{'-' * 70}")
+        print(f"\n{'-' * 70}\nPER-DAY (rebalanced)\n{'-' * 70}")
         for _, r in reb["per_day"].iterrows():
             print(f"  {r['local_date']}  actual {r['actual']:.0f}F   "
                   f"P&L {r['pnl']:>+9.2f}  ({r['ret_pct']:+.1f}%)")
     print(line)
 
 
-def sweep(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF) -> None:
+def sweep(df: pd.DataFrame, truth: dict, pmf: OffsetPMF) -> None:
     """Kelly x no-trade-band grid. A result that only works at one exact setting
     is overfit; the grid makes that visible."""
     print(f"\n{'-' * 70}\nPARAMETER SWEEP (ROI %)\n{'-' * 70}")
@@ -443,7 +506,7 @@ def sweep(df: pd.DataFrame, truth: dict, rcdf: ResidualCDF) -> None:
     for k in kellys:
         cells = []
         for b in bands:
-            r = run_rebalanced(df, truth, rcdf, kelly=k, band=b)
+            r = run_rebalanced(df, truth, pmf, kelly=k, band=b)
             cells.append(f"{r['roi_pct']:>+9.1f}")
         print(f"  {k:>11.2f} " + "".join(cells))
 
@@ -452,7 +515,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Score the daily-high model against Kalshi.")
     ap.add_argument("--market-log", default=str(MARKET_LOG))
     ap.add_argument("--nowcast-log", default=str(NOWCAST_LOG))
-    ap.add_argument("--residuals", default=str(RESIDUAL_MODEL))
+    ap.add_argument("--pmf", default=str(OFFSET_PMF))
     ap.add_argument("--start", help="YYYY-MM-DD (NY local) inclusive")
     ap.add_argument("--end", help="YYYY-MM-DD (NY local) inclusive")
     ap.add_argument("--kelly", type=float, default=KELLY_MULT)
@@ -461,10 +524,10 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true", help="run the kelly x band grid")
     args = ap.parse_args()
 
-    resid_path = Path(args.residuals)
-    if not resid_path.exists():
-        raise SystemExit(f"{resid_path.name} not found. Run: python build_residuals.py")
-    rcdf = ResidualCDF(pd.read_csv(resid_path))
+    pmf_path = Path(args.pmf)
+    if not pmf_path.exists():
+        raise SystemExit(f"{pmf_path.name} not found. Run: python build_residuals.py")
+    pmf = OffsetPMF(pd.read_csv(pmf_path))
 
     df = load_joined(Path(args.market_log), Path(args.nowcast_log))
     if args.start:
@@ -478,12 +541,14 @@ def main() -> None:
     if not truth:
         raise SystemExit("No CLI settlement available yet for these dates.")
 
-    reb = run_rebalanced(df, truth, rcdf, kelly=args.kelly, band=args.band, thresh=args.edge)
-    flat = run_flat(df, truth, rcdf, thresh=args.edge)
-    brier = brier_scores(df, truth, rcdf)
-    print_report(reb, flat, brier, df)
+    reb = run_rebalanced(df, truth, pmf, kelly=args.kelly, band=args.band, thresh=args.edge)
+    flat = run_flat(df, truth, pmf, thresh=args.edge)
+    fav = run_favourite(df, truth)
+    vs = model_vs_favourite(df, truth, pmf)
+    brier = brier_scores(df, truth, pmf)
+    print_report(reb, flat, fav, vs, brier, df)
     if args.sweep:
-        sweep(df, truth, rcdf)
+        sweep(df, truth, pmf)
 
 
 if __name__ == "__main__":

@@ -90,9 +90,8 @@ def _append_log_row(row: dict) -> None:
     header, leaving a ragged CSV that pd.read_csv refuses to parse. Columns
     the header has but this row lacks are written empty.
 
-    get_nowcast() runs on every poll — the 60s retries waiting for a late
-    METAR, and again on each Discord reconnect — so an unchanged row would
-    otherwise be logged ~50x an hour. The duplicate check compares against the
+    Callers log once per posted hour (see _log_once), but this check stays as
+    a second guard against an unchanged row being written twice. The duplicate check compares against the
     last line on disk rather than in-memory state, because systemd restarts
     (Restart=always) and deploys would otherwise reset the guard and write a
     duplicate on every boot. A retry that actually moved the prediction
@@ -221,6 +220,10 @@ def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
     rows = []
     for r in records:
         clouds = r.get("clouds") or []
+        # Clear sky arrives as "clouds": [] plus a top-level "cover": "CLR".
+        # Reading only clouds[0] left skyc1 NaN, which engineer_features then
+        # filled to 4 oktas — the model never saw a clear hour live.
+        top_cover = r.get("cover") if isinstance(r.get("cover"), str) else np.nan
         wdir = r.get("wdir")
         temp_c, dewp_c = r.get("temp"), r.get("dewp")
         # aviationweather has no humidity field; derive relh (%) from temp/dewp
@@ -240,7 +243,7 @@ def fetch_avwx(station: str, hours_back: float) -> pd.DataFrame:
             "sknt": r.get("wspd", np.nan),
             "mslp": r.get("slp", np.nan),
             "p01i": r.get("precip", np.nan),
-            "skyc1": clouds[0]["cover"] if len(clouds) > 0 else np.nan,
+            "skyc1": clouds[0]["cover"] if len(clouds) > 0 else top_cover,
             "skyc2": clouds[1]["cover"] if len(clouds) > 1 else np.nan,
             "skyc3": clouds[2]["cover"] if len(clouds) > 2 else np.nan,
             "skyl1": clouds[0]["base"] if len(clouds) > 0 else np.nan,
@@ -379,7 +382,10 @@ def cloud_oktas(row) -> float:
 
 def solar_zenith_deg(valid_utc: pd.Series) -> np.ndarray:
     t = valid_utc.dt.tz_convert("UTC")
-    jd = t.astype("int64") / 86_400_000_000_000 + 2440587.5
+    # Unit-independent Julian day. Do NOT use t.astype("int64"): its scale
+    # depends on the datetime resolution (ns on pandas 2, often us on pandas 3),
+    # and dividing microseconds by a nanosecond day put every row in Jan 1970.
+    jd = (t - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(days=1) + 2440587.5
     n = jd - 2451545.0
     L = (280.460 + 0.9856474 * n) % 360
     g = np.radians((357.528 + 0.9856003 * n) % 360)
@@ -467,6 +473,11 @@ def engineer_features(raw: pd.DataFrame, upstream: dict[str, pd.DataFrame]) -> p
         df["metar"].apply(parse_6hr_max) if "metar" in df.columns else np.nan
     )
 
+    # ~60 single-column inserts above leave the frame fragmented, and pandas
+    # logged a PerformanceWarning per insert below (78 lines a day in the
+    # journal). One copy consolidates it; the frame is only ~72 rows.
+    df = df.copy()
+
     # Upstream-station features.
     for code in UPSTREAM:
         udf = upstream.get(code, pd.DataFrame())
@@ -530,7 +541,62 @@ def _apply_climatology(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Nowcast ────────────────────────────────────────────────────────────────
-def get_nowcast() -> dict:
+# The NWS climate day that CLINYC (and therefore Kalshi) settles on is local
+# STANDARD time all year: 01:00-01:00 EDT during daylight saving. The obs floor
+# must use the same day, or a warm 00:51 EDT ob from the previous climate day
+# becomes a floor above the settlement (2026-10-17: floor 63, CLI 62).
+CLIMATE_TZ = scorer.CLIMATE_TZ
+
+# Evening lock: from this NY-local hour on, once the current temp has fallen at
+# least EVENING_LOCK_MARGIN_F below the observed high, the high is in. Over the
+# first 53 live days the rounded observed high matched the CLI in 92% of
+# evening hours while max(obs, pred) matched only 49-64% (the model keeps
+# calling ~0.5F above a high that already happened).
+EVENING_LOCK_HOUR = 19
+EVENING_LOCK_MARGIN_F = 1.0
+
+
+def _observed_high(df: pd.DataFrame, climate_date) -> float | None:
+    """Highest observation so far on `climate_date` (LST climate day): hourly
+    tmpf plus METAR 6-hr max groups whose whole window lies inside that day.
+
+    The 6-hr group (00/06/12/18Z) covers the trailing 6 hours; for the first
+    group after midnight that window straddles into the previous climate day
+    and can carry yesterday evening's warmth, so it is only trusted when the
+    window start is on the same climate date.
+    """
+    valid_lst = df["valid"].dt.tz_convert(CLIMATE_TZ)
+    day_mask = valid_lst.dt.date == climate_date
+    day_tmpf = df.loc[day_mask, "tmpf"].dropna()
+    max_tmpf = float(day_tmpf.max()) if not day_tmpf.empty else None
+
+    window_start = valid_lst - pd.Timedelta(hours=6)
+    mxt_mask = day_mask & (window_start.dt.date == climate_date)
+    day_mxt = df.loc[mxt_mask, "mxtmpf_6hr"].dropna()
+    max_mxt = float(day_mxt.max()) if not day_mxt.empty else None
+
+    candidates = [v for v in (max_tmpf, max_mxt) if v is not None]
+    return max(candidates) if candidates else None
+
+
+def reassess_high(pred_high: float, obs_high: float | None, cur_temp: float,
+                  local_hour: int) -> float:
+    """Best single estimate of the day's high.
+
+    Normally max(observed, model) — the high cannot come in below what has been
+    seen. In the evening, once the temperature has clearly turned down, the
+    observed high is the answer and the model's residual optimism is dropped.
+    """
+    if obs_high is None:
+        return pred_high
+    if local_hour >= EVENING_LOCK_HOUR and cur_temp <= obs_high - EVENING_LOCK_MARGIN_F:
+        return obs_high
+    return max(obs_high, pred_high)
+
+
+def compute_nowcast() -> dict:
+    """Fetch obs, build features, predict. No side effects (no log writes), so
+    it can be re-run every minute while waiting for late stations."""
     raw = fetch_obs(PRIMARY, hours_back=72)
     if raw.empty:
         raise RuntimeError("No KNYC obs from aviationweather.gov or IEM")
@@ -576,6 +642,15 @@ def get_nowcast() -> dict:
         log.warning("Forecasting without %d/%d upstream station(s): %s",
                     len(degraded), len(UPSTREAM), ", ".join(degraded))
 
+    # Stations still reporting whose ob for THIS hour has not landed yet: their
+    # columns are forward-filled from the previous hour, which is not what the
+    # model was trained on. KPHL/KBWI/KBOS issue at :54 and were stale in ~98%
+    # of hours at the :55 tick; post_nowcast_to_channel waits for them.
+    stale_upstream = [
+        s for s in UPSTREAM
+        if s not in degraded and (upstream[s].empty or upstream[s]["valid"].max() < valid_t)
+    ]
+
     cur_temp = float(latest["tmpf"].iloc[0])
     cur_dwpf = float(latest["dwpf"].iloc[0])
     cur_relh = float(latest["relh"].iloc[0])
@@ -587,63 +662,24 @@ def get_nowcast() -> dict:
     pred_t3h = float(model_t3h.predict(X)[0])
     pred_t6h = float(model_t6h.predict(X)[0])
 
-    # Obs high floor — NY-local calendar day.
+    # today_local (NY civil date) names the Kalshi event; the floor itself is
+    # taken over the LST climate day of that date (see CLIMATE_TZ).
     today_local = datetime.now(NY_TZ).date()
-    today_mask = df["local_date"] == today_local
-    today_tmpf = df.loc[today_mask, "tmpf"].dropna()
-    max_tmpf = float(today_tmpf.max()) if not today_tmpf.empty else None
-
-    # The METAR 6-hr max group (00/06/12/18Z) covers the trailing 6 hours, which
-    # for early-morning obs (e.g. ~06Z / 1:51am EDT) straddles local midnight —
-    # its max can reflect yesterday evening's warmth, not anything seen today.
-    # Only trust it when that window is fully inside today's local calendar day.
-    window_start_local = df["valid_local"] - pd.Timedelta(hours=6)
-    mxt_same_day_mask = today_mask & (window_start_local.dt.date == today_local)
-    today_mxt = df.loc[mxt_same_day_mask, "mxtmpf_6hr"].dropna()
-    max_mxt = float(today_mxt.max()) if not today_mxt.empty else None
-    candidates = [v for v in (max_tmpf, max_mxt) if v is not None]
-    obs_high = max(candidates) if candidates else None
-    reassessed = max(obs_high if obs_high is not None else float("-inf"), pred_high)
+    obs_high = _observed_high(df, today_local)
+    local_hour = valid_t.astimezone(NY_TZ).hour
+    reassessed = reassess_high(pred_high, obs_high, cur_temp, local_hour)
 
     log.info(
-        "valid=%s temp=%.1f t3h=%.1f t6h=%.1f high=%.1f obs_high=%s reassessed=%.1f age=%s",
+        "valid=%s temp=%.1f t3h=%.1f t6h=%.1f high=%.1f obs_high=%s reassessed=%.1f "
+        "age=%s stale_upstream=%s",
         valid_t.isoformat(), cur_temp, pred_t3h, pred_t6h, pred_high,
         f"{obs_high:.1f}" if obs_high is not None else "-",
-        reassessed, age,
+        reassessed, age, ",".join(stale_upstream) or "-",
     )
-
-    # Persistent log row for postmortem analysis.
-    try:
-        row = {**X.iloc[0].to_dict(),
-               "valid_t": valid_t.isoformat(),
-               "pred_high": pred_high, "pred_t3h": pred_t3h, "pred_t6h": pred_t6h,
-               "obs_high": obs_high, "reassessed": reassessed}
-        _append_log_row(row)
-    except Exception as exc:
-        log.warning("nowcast log write failed: %s", exc)
-
-    # Kalshi bracket prices at this exact hour. Historical prices cannot be
-    # recovered after the fact — the order book is gone once the event settles —
-    # so this snapshot is the only chance to capture them. Everything here is
-    # best-effort: a Kalshi outage must never stop a forecast from posting.
-    try:
-        brackets = km.fetch_brackets(today_local)
-        if brackets.empty:
-            log.info("no open Kalshi contracts for %s — skipping market log", today_local)
-        else:
-            problems = km.check_ladder(brackets)
-            if problems:
-                log.warning("Kalshi ladder looks wrong: %s", "; ".join(problems))
-            snap = brackets.copy()
-            snap.insert(0, "valid_t", valid_t.isoformat())
-            snap.to_csv(MARKET_LOG_PATH, mode="a",
-                        header=not MARKET_LOG_PATH.exists(), index=False)
-            tape.append_row(valid_t, pred_high, obs_high, reassessed, brackets)
-    except Exception as exc:
-        log.warning("market log write failed: %s", exc)
 
     return {
         "valid_t": valid_t,
+        "today_local": today_local,
         "cur_temp": cur_temp,
         "cur_dwpf": cur_dwpf,
         "cur_relh": cur_relh,
@@ -655,7 +691,61 @@ def get_nowcast() -> dict:
         "obs_high": obs_high,
         "reassessed": reassessed,
         "degraded": degraded,
+        "stale_upstream": stale_upstream,
+        "features": X.iloc[0].to_dict(),
     }
+
+
+def log_nowcast(data: dict) -> None:
+    """Persist one posted nowcast: the nowcast-log row, the Kalshi ladder
+    snapshot and the prediction-tape row. Called once per posted hour."""
+    valid_t = data["valid_t"]
+    try:
+        row = {**data["features"],
+               "valid_t": valid_t.isoformat(),
+               "pred_high": data["pred_high"], "pred_t3h": data["pred_t3h"],
+               "pred_t6h": data["pred_t6h"],
+               "obs_high": data["obs_high"], "reassessed": data["reassessed"]}
+        _append_log_row(row)
+    except Exception as exc:
+        log.warning("nowcast log write failed: %s", exc)
+
+    # Kalshi bracket prices at this exact hour. Historical prices cannot be
+    # recovered after the fact — the order book is gone once the event settles —
+    # so this snapshot is the only chance to capture them. Everything here is
+    # best-effort: a Kalshi outage must never stop a forecast from posting.
+    try:
+        brackets = km.fetch_brackets(data["today_local"])
+        if brackets.empty:
+            log.info("no open Kalshi contracts for %s — skipping market log",
+                     data["today_local"])
+        else:
+            problems = km.check_ladder(brackets)
+            if problems:
+                log.warning("Kalshi ladder looks wrong: %s", "; ".join(problems))
+            snap = brackets.copy()
+            snap.insert(0, "valid_t", valid_t.isoformat())
+            snap.to_csv(MARKET_LOG_PATH, mode="a",
+                        header=not MARKET_LOG_PATH.exists(), index=False)
+            tape.append_row(valid_t, data["pred_high"], data["obs_high"],
+                            data["reassessed"], brackets)
+    except Exception as exc:
+        log.warning("market log write failed: %s", exc)
+
+
+def _last_logged_valid() -> datetime | None:
+    """valid_t of the newest row in nowcast_log.csv, so a restart neither
+    re-logs the current hour nor forgets what it already posted."""
+    last = _last_log_line()
+    if not last:
+        return None
+    try:
+        header = pd.read_csv(LOG_PATH, nrows=0).columns.tolist()
+        row = pd.read_csv(StringIO(last), header=None, names=header)
+        return pd.Timestamp(row["valid_t"].iloc[0]).to_pydatetime()
+    except Exception as exc:
+        log.warning("could not read last valid_t from %s: %s", LOG_PATH.name, exc)
+        return None
 
 
 # ── Discord embed ──────────────────────────────────────────────────────────
@@ -713,6 +803,9 @@ def build_embed(data: dict) -> discord.Embed:
     degraded = data.get("degraded") or []
     if degraded:
         footer += f"\n⚠️ {len(degraded)} upstream station(s) unavailable: {', '.join(degraded)}"
+    stale_up = data.get("stale_upstream") or []
+    if stale_up:
+        footer += f"\n⏱️ Using previous hour for: {', '.join(stale_up)}"
     embed.set_footer(text=footer)
     return embed
 
@@ -721,19 +814,43 @@ def build_embed(data: dict) -> discord.Embed:
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 
-last_posted_valid: datetime | None = None
+# Seeded from the log so a restart (systemd, deploy, apt upgrade) neither
+# re-logs the hour it already logged nor loses track of what it posted.
+last_logged_valid: datetime | None = _last_logged_valid()
+last_posted_valid: datetime | None = last_logged_valid
 FRESH_RETRY_DEADLINE = timedelta(minutes=50)
 FRESH_RETRY_INTERVAL = timedelta(seconds=60)
+# How long the hourly tick waits for upstream stations whose ob for this hour
+# has not landed yet (KPHL/KBWI/KBOS issue at :54, after the :55 tick starts
+# fetching). After this the post goes out with their previous-hour values.
+UPSTREAM_SYNC_WAIT = timedelta(minutes=8)
+
+
+def _log_once(data: dict) -> None:
+    """log_nowcast, but at most once per valid_t across polls and restarts."""
+    global last_logged_valid
+    if last_logged_valid is not None and data["valid_t"] <= last_logged_valid:
+        log.info("valid %s already logged — not logging again",
+                 data["valid_t"].isoformat())
+        return
+    log_nowcast(data)
+    last_logged_valid = data["valid_t"]
 
 
 async def post_nowcast_to_channel(*, wait_for_fresh: bool = False) -> None:
-    """Fetch + post a nowcast embed.
+    """Fetch + post a nowcast embed, then log it once.
 
     wait_for_fresh=True (the hourly :55 tick): if the newest available METAR
     is the same one already posted last hour, retry every 60s until a newer
     ob shows up — KNYC's METAR usually lands ~:51-:53 but can run late.
     Capped at FRESH_RETRY_DEADLINE so a dead feed can't stall past the next
-    scheduled tick.
+    scheduled tick. Once KNYC is fresh, also wait up to UPSTREAM_SYNC_WAIT for
+    late upstream stations so the model sees this hour's inputs, not last
+    hour's forward-filled ones.
+
+    Only the attempt that is actually posted is logged: retries are pure
+    recomputation, so the logs get one row per hour with the inputs and Kalshi
+    prices as they stood when the forecast went out.
     """
     global last_posted_valid
     guild = bot.get_guild(GUILD_ID)
@@ -745,32 +862,53 @@ async def post_nowcast_to_channel(*, wait_for_fresh: bool = False) -> None:
         log.error("No #%s channel in %s", CHANNEL_NAME, guild.name)
         return
 
-    deadline = datetime.now(timezone.utc) + FRESH_RETRY_DEADLINE if wait_for_fresh else None
+    tick_start = datetime.now(timezone.utc)
+    deadline = tick_start + FRESH_RETRY_DEADLINE if wait_for_fresh else None
     last_exc: Exception | None = None
     attempt = 0
 
     while True:
         attempt += 1
         try:
-            # In a worker thread: get_nowcast() blocks for 10-40s (9 HTTP
+            # In a worker thread: compute_nowcast() blocks for 10-40s (9 HTTP
             # fetches, their sleeps, and model inference). On the event loop it
             # starves the gateway heartbeat, which makes Discord drop the
             # connection and forces a RESUME every cycle.
-            data = await asyncio.to_thread(get_nowcast)
+            data = await asyncio.to_thread(compute_nowcast)
             stale = (
                 wait_for_fresh
                 and last_posted_valid is not None
                 and data["valid_t"] <= last_posted_valid
             )
-            if not stale:
+            waiting_upstream = (
+                wait_for_fresh
+                and not stale
+                and data["stale_upstream"]
+                and datetime.now(timezone.utc) - tick_start < UPSTREAM_SYNC_WAIT
+            )
+            if not stale and not waiting_upstream:
                 embed = build_embed(data)
                 await channel.send(embed=embed)
                 last_posted_valid = data["valid_t"]
                 log.info("Posted — reassessed high %.1f°F (valid %s)",
                           data["reassessed"], data["valid_t"].isoformat())
+                if data["stale_upstream"] and wait_for_fresh:
+                    log.warning("posted after %d min wait with previous-hour data for: %s",
+                                UPSTREAM_SYNC_WAIT.total_seconds() // 60,
+                                ", ".join(data["stale_upstream"]))
+                # Logging hits Kalshi + disk; a failure here must not undo or
+                # repeat the post, and it must not block the event loop.
+                try:
+                    await asyncio.to_thread(_log_once, data)
+                except Exception as exc:
+                    log.warning("logging nowcast failed: %s", exc)
                 return
-            log.info("METAR still %s (no newer ob yet) — retrying in 60s",
-                      data["valid_t"].isoformat())
+            if stale:
+                log.info("METAR still %s (no newer ob yet) — retrying in 60s",
+                          data["valid_t"].isoformat())
+            else:
+                log.info("waiting for this hour's ob from %s — retrying in 60s",
+                          ", ".join(data["stale_upstream"]))
             last_exc = None
         except Exception as exc:
             last_exc = exc
@@ -799,6 +937,7 @@ async def on_ready() -> None:
         nowcast_loop.start()
     if not scorecard_loop.is_running():
         scorecard_loop.start()
+    await catch_up_scorecard()
 
 
 @tasks.loop(hours=1)
@@ -827,6 +966,45 @@ async def before_nowcast_loop() -> None:
 # day spill past midnight, and the official CLI high often finalizes overnight,
 # so an early-morning run is the first moment the day is fully settled.
 SCORE_POST_TIME = dtime(hour=6, minute=30, tzinfo=NY_TZ)
+
+# Which day's scorecard last went out. Restarts cluster around 06:30 ET (likely
+# unattended-upgrades), and a restart straddling 06:30:00 silently skipped that
+# morning's scorecard. On startup the bot posts any scorecard it missed.
+STATE_PATH = HERE / "bot_state.json"
+
+
+def _read_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_scorecard(target_date) -> None:
+    try:
+        state = _read_state()
+        state["last_scorecard_date"] = target_date.isoformat()
+        STATE_PATH.write_text(json.dumps(state, indent=2))
+    except OSError as exc:
+        log.warning("could not write %s: %s", STATE_PATH.name, exc)
+
+
+async def catch_up_scorecard() -> None:
+    """Post yesterday's scorecard if 06:30 ET has passed and it never went out."""
+    now = datetime.now(NY_TZ)
+    if now.time() < dtime(SCORE_POST_TIME.hour, SCORE_POST_TIME.minute):
+        return  # the scheduled loop will handle today's
+    yesterday = now.date() - timedelta(days=1)
+    last = _read_state().get("last_scorecard_date")
+    if last is None:
+        # First run with state tracking: assume this morning's already went out
+        # rather than double-posting on deploy.
+        _record_scorecard(yesterday)
+        return
+    if last >= yesterday.isoformat():
+        return
+    log.info("scorecard for %s was missed (last posted %s) — posting now", yesterday, last)
+    await post_daily_scorecard()
 
 
 def _compute_scorecard(target_date) -> dict:
@@ -953,9 +1131,11 @@ async def post_daily_scorecard() -> None:
         await channel.send(
             f"📊 No predictions were logged for {target_date} — bot may have been offline."
         )
+        _record_scorecard(target_date)
         return
     await channel.send(embed=build_scorecard_embed(data))
     log.info("Posted scorecard for %s", target_date)
+    _record_scorecard(target_date)
 
     await post_daily_performance(guild, target_date, data)
 
@@ -997,4 +1177,5 @@ async def before_scorecard_loop() -> None:
              SCORE_POST_TIME.hour, SCORE_POST_TIME.minute, SCORE_CHANNEL_NAME)
 
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)

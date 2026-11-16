@@ -20,3 +20,9 @@ __pycache__/
 
 # Backups / scratch
 *.bak
+
+# Bot runtime state (last scorecard date, etc.) - per host
+bot_state.json
+
+# Data pulled down from the production server for review
+server_pull/

@@ -237,8 +237,9 @@ def solar_zenith_deg(valid_utc: pd.Series, lat: float, lon: float) -> np.ndarray
     valid_utc must be timezone-aware UTC.
     """
     t = valid_utc.dt.tz_convert("UTC")
-    # Julian day
-    jd = t.astype("int64") / 86_400_000_000_000 + 2440587.5
+    # Julian day — unit-independent. t.astype("int64") is ns on pandas 2 but
+    # us on pandas 3, which silently pinned every row to January 1970.
+    jd = (t - pd.Timestamp("1970-01-01", tz="UTC")) / pd.Timedelta(days=1) + 2440587.5
     n = jd - 2451545.0
     # Mean longitude and anomaly (degrees)
     L = (280.460 + 0.9856474 * n) % 360

@@ -4,11 +4,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# DEPLOY.md creates .venv/, but hosts set up by hand may use venv/.
+if [ -x .venv/bin/pip ]; then
+  VENV=.venv
+elif [ -x venv/bin/pip ]; then
+  VENV=venv
+else
+  echo "No virtualenv found (looked for .venv/ and venv/)" >&2
+  exit 1
+fi
+
 echo "==> git pull"
 git pull --ff-only
 
-echo "==> pip install (in case deps changed)"
-.venv/bin/pip install -r requirements.txt --quiet
+echo "==> pip install into $VENV/ (in case deps changed)"
+"$VENV/bin/pip" install -r requirements.txt --quiet
 
 echo "==> restart service"
 sudo systemctl restart knyc-bot

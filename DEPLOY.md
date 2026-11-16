@@ -106,7 +106,8 @@ live: `journalctl -u knyc-bot -f`.
 cd ~/NYC-Temp-Engine && chmod +x deploy.sh && ./deploy.sh
 ```
 
-`deploy.sh` = `git pull` + `pip install -r requirements.txt` + restart. Because
+`deploy.sh` = `git pull` + `pip install -r requirements.txt` + restart. It uses
+`.venv/` (as created above) or `venv/` if the host was set up that way. Because
 the runtime `nowcast_log.csv` is gitignored, pulls never conflict with the
 host's live prediction history.
 

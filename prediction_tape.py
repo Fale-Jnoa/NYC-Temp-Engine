@@ -54,9 +54,15 @@ def append_row(valid_t: datetime, pred_raw: float, obs_high: float | None,
 
     `brackets` is a `kalshi_market.fetch_brackets()` frame for the same NY-local
     date. Settlement columns are left blank for `backfill()` to fill later.
+
+    The bracket is the one containing `reassessed` (the bot's best estimate,
+    floored by what has already been observed). Before 2026-11-16 it was the
+    one containing `pred_raw`, which ignored the observed high and hit 9% of
+    the time after 7 PM; hit rates are not comparable across that cut-over.
+    `pred_raw` / `pred_high` still record the raw model output.
     """
     local = valid_t.astimezone(NY_TZ)
-    b = km.bracket_for(brackets, pred_raw)
+    b = km.bracket_for(brackets, reassessed)
     row = {
         "valid_t": valid_t.isoformat(),
         "local_date": local.date().isoformat(),
@@ -81,7 +87,10 @@ def append_row(valid_t: datetime, pred_raw: float, obs_high: float | None,
 
 
 def load(path: Path = TAPE_PATH) -> pd.DataFrame:
-    """Read the tape, dropping duplicate valid_t (bot restarts re-post an hour)."""
+    """Read the tape, dropping duplicate valid_t (bot restarts re-post an hour).
+
+    keep="first": the first row is the one written when the forecast was
+    posted; later duplicates came from re-polls with different prices."""
     if not path.exists():
         return pd.DataFrame(columns=COLUMNS)
     # Force the text columns to object dtype: on a fresh tape they are entirely
@@ -89,7 +98,7 @@ def load(path: Path = TAPE_PATH) -> pd.DataFrame:
     # accept a string into during backfill.
     df = pd.read_csv(path, dtype={"hit": "object", "bracket": "object",
                                   "bracket_ticker": "object"})
-    return (df.drop_duplicates("valid_t", keep="last")
+    return (df.drop_duplicates("valid_t", keep="first")
               .sort_values("valid_t")
               .reset_index(drop=True))
 

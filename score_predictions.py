@@ -54,6 +54,11 @@ import pandas as pd
 import requests
 
 NY_TZ = ZoneInfo("America/New_York")
+# The NWS climate day (CLINYC / DSMNYC) runs midnight-to-midnight LOCAL STANDARD
+# TIME all year, i.e. 01:00-01:00 EDT during daylight saving. Clock times printed
+# in those products are LST too, so they must be read in this fixed offset and
+# only then converted to NY civil time.
+CLIMATE_TZ = timezone(timedelta(hours=-5))
 HERE = Path(__file__).resolve().parent
 STATION = "KNYC"
 HIT_TOL = 1.0  # +/-F for a t+3h / t+6h "hit"
@@ -67,16 +72,32 @@ TEMP_MIN_F, TEMP_MAX_F = -20.0, 115.0
 
 # ── HTTP with polite retry ──────────────────────────────────────────────────
 def _get(url: str, *, params: dict | None = None, timeout: int = 120) -> requests.Response:
+    """GET with backoff on rate limits, transient 5xx and network errors.
+
+    A single Kalshi/IEM 503 used to raise immediately and cost that hour's
+    market snapshot or the morning scorecard."""
+    last_err: Exception | None = None
     for attempt in range(4):
-        resp = requests.get(url, params=params, timeout=timeout)
+        wait = 5 * (attempt + 1)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_err = exc
+            print(f"  network error ({exc.__class__.__name__}) -- retrying in {wait}s")
+            time.sleep(wait)
+            continue
         if resp.status_code == 429 or "Too many requests" in resp.text[:80]:
-            wait = 5 * (attempt + 1)
             print(f"  rate-limited -- sleeping {wait}s")
+            time.sleep(wait)
+            continue
+        if resp.status_code >= 500:
+            last_err = requests.HTTPError(f"{resp.status_code} from {url}", response=resp)
+            print(f"  server error {resp.status_code} -- retrying in {wait}s")
             time.sleep(wait)
             continue
         resp.raise_for_status()
         return resp
-    raise RuntimeError(f"request failed after retries: {url}")
+    raise RuntimeError(f"request failed after retries: {url} ({last_err})")
 
 
 # ── Ground-truth: hourly obs ────────────────────────────────────────────────
@@ -169,7 +190,8 @@ def fetch_cli(start: datetime, end: datetime) -> pd.DataFrame:
         if mm and float(mm.group(1)) == val:
             hm = _parse_clock(mm.group(2), mm.group(3))
             if hm:
-                htime = datetime(d.year, d.month, d.day, hm[0], hm[1], tzinfo=NY_TZ)
+                htime = datetime(d.year, d.month, d.day, hm[0], hm[1],
+                                 tzinfo=CLIMATE_TZ).astimezone(NY_TZ)
         cur = best.get(d)
         if cur is None or val > cur["cli_max"]:
             best[d] = {"local_date": d, "cli_max": val, "cli_time": htime}
@@ -212,7 +234,8 @@ def fetch_dsm(start: datetime, end: datetime) -> pd.DataFrame:
                 break
         if d is None:
             continue
-        dtime = datetime(d.year, d.month, d.day, hh, mn, tzinfo=NY_TZ)
+        # DSM times are LST (see CLIMATE_TZ); convert to NY civil time.
+        dtime = datetime(d.year, d.month, d.day, hh, mn, tzinfo=CLIMATE_TZ).astimezone(NY_TZ)
         cur = best.get(d)
         if cur is None or val > cur["dsm_max"]:
             best[d] = {"local_date": d, "dsm_max": val, "dsm_time": dtime}
@@ -309,8 +332,9 @@ def load_predictions(path: Path) -> pd.DataFrame:
     df["valid_utc"] = pd.to_datetime(df["valid_t"], utc=True)
     for c in ("pred_high", "pred_t3h", "pred_t6h"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    # One prediction per obs time; keep the most recent write.
-    df = df.drop_duplicates("valid_utc", keep="last").sort_values("valid_utc")
+    # One prediction per obs time. Keep the FIRST write: that is what was posted
+    # at the time; later duplicates were re-polls (pre-2026-11 logs only).
+    df = df.drop_duplicates("valid_utc", keep="first").sort_values("valid_utc")
     df["valid_local"] = df["valid_utc"].dt.tz_convert(NY_TZ)
     df["local_date"] = df["valid_local"].dt.date
     df["local_hour"] = df["valid_local"].dt.hour

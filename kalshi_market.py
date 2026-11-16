@@ -114,7 +114,9 @@ def fetch_brackets(d: date | None = None, *, timeout: int = 15) -> pd.DataFrame:
             "ticker": m.get("ticker"),
             "strike_type": m.get("strike_type"),
             "lo": lo, "hi": hi,
-            "subtitle": m.get("subtitle"),
+            # The API moved the human-readable range to yes_sub_title; without
+            # the fallback check_ladder's subtitle cross-check silently stops.
+            "subtitle": m.get("subtitle") or m.get("yes_sub_title"),
             "yes_bid": _f(m.get("yes_bid_dollars")),
             "yes_ask": _f(m.get("yes_ask_dollars")),
             "no_bid": _f(m.get("no_bid_dollars")),
