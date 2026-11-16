@@ -18,8 +18,8 @@ is unsuitable at bracket boundaries.
 
 Usage
 -----
-    python prediction_tape.py              # print the tape
-    python prediction_tape.py --backfill   # fill settled days, then print
+    python -m knyc.prediction_tape              # print the tape
+    python -m knyc.prediction_tape --backfill   # fill settled days, then print
 """
 from __future__ import annotations
 
@@ -31,12 +31,12 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-import kalshi_market as km
-import score_predictions as sp
+from knyc import kalshi_market as km
+from knyc import paths
+from knyc import score_predictions as sp
 
 NY_TZ = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
-TAPE_PATH = HERE / "prediction_tape.csv"
+TAPE_PATH = paths.PREDICTION_TAPE
 
 COLUMNS = [
     "valid_t", "local_date", "local_hour",

@@ -36,9 +36,9 @@ exchange settles on.
 
 Usage
 -----
-    python market_scorer.py
-    python market_scorer.py --start 2026-08-01 --end 2026-08-14
-    python market_scorer.py --sweep          # kelly x band grid
+    python -m knyc.market_scorer
+    python -m knyc.market_scorer --start 2026-08-01 --end 2026-08-14
+    python -m knyc.market_scorer --sweep          # kelly x band grid
 """
 from __future__ import annotations
 
@@ -51,16 +51,16 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-import kalshi_market as km
-import score_predictions as sp
-from build_residuals import K_COLS, K_MAX, K_MIN, gap_bucket
+from knyc import kalshi_market as km
+from knyc import paths
+from knyc import score_predictions as sp
+from knyc.build_residuals import K_COLS, K_MAX, K_MIN, gap_bucket
 
 NY_TZ = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
 
-MARKET_LOG = HERE / "market_log.csv"
-NOWCAST_LOG = HERE / "nowcast_log.csv"
-OFFSET_PMF = HERE / "offset_pmf.csv"
+MARKET_LOG = paths.MARKET_LOG
+NOWCAST_LOG = paths.NOWCAST_LOG
+OFFSET_PMF = paths.OFFSET_PMF
 
 # Strategy defaults (sweepable — see --sweep).
 EDGE_THRESHOLD = 0.05   # minimum model_prob - ask before any interest
@@ -526,7 +526,7 @@ def main() -> None:
 
     pmf_path = Path(args.pmf)
     if not pmf_path.exists():
-        raise SystemExit(f"{pmf_path.name} not found. Run: python build_residuals.py")
+        raise SystemExit(f"{pmf_path.name} not found. Run: python -m knyc.build_residuals")
     pmf = OffsetPMF(pd.read_csv(pmf_path))
 
     df = load_joined(Path(args.market_log), Path(args.nowcast_log))

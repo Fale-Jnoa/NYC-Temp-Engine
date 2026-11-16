@@ -19,7 +19,7 @@ in the code review:
 
 Run once to produce knyc_training.csv. Re-run periodically to ingest new obs.
 
-    python build_training_data.py --start 2010-01-01 --end 2026-02-01
+    python -m knyc.build_training_data --start 2010-01-01 --end 2026-02-01
 
 Outputs:
     knyc_training.csv
@@ -33,15 +33,15 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 
+from knyc import paths
+
 NY_TZ = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
 
 PRIMARY = "KNYC"
 UPSTREAM = ["KEWR", "KLGA", "KJFK", "KTEB", "KPHL", "KBWI", "KDCA", "KBOS"]
@@ -385,7 +385,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2010-01-01")
     ap.add_argument("--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    ap.add_argument("--out", default=str(HERE / "knyc_training.csv"))
+    ap.add_argument("--out", default=str(paths.TRAINING_CSV))
     args = ap.parse_args()
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)

@@ -107,9 +107,11 @@ cd ~/NYC-Temp-Engine && chmod +x deploy.sh && ./deploy.sh
 ```
 
 `deploy.sh` = `git pull` + `pip install -r requirements.txt` + restart. It uses
-`.venv/` (as created above) or `venv/` if the host was set up that way. Because
-the runtime `nowcast_log.csv` is gitignored, pulls never conflict with the
-host's live prediction history.
+`.venv/` (as created above) or `venv/` if the host was set up that way. Everything
+the bot writes lives in the gitignored `logs/` folder, so pulls never conflict
+with the host's live prediction history. (Hosts set up before 2026-11-16 kept
+those files in the repo root; the bot moves them into `logs/` on its first
+start after the update.)
 
 ## Notes
 

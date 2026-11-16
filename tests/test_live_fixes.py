@@ -1,6 +1,6 @@
 """
 Offline regression tests for the fixes from the 2026-11 production review
-(server_pull/REVIEW_PLAN.md). No network access needed.
+(docs/REVIEW_2026-11.md). No network access needed.
 
     python -m pytest tests/        # or:  python tests/test_live_fixes.py
 
@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
 os.environ.setdefault("GUILD_ID", "1")
 
-import build_training_data as btd  # noqa: E402
 import knyc_discord_bot as bot  # noqa: E402
-import score_predictions as sp  # noqa: E402
+from knyc import build_training_data as btd  # noqa: E402
+from knyc import score_predictions as sp  # noqa: E402
 
 
 def _times(unit: str) -> pd.Series:
@@ -183,6 +183,33 @@ def test_restart_does_not_relog_hour():
     sent, logged, _ = _run_post_scenario([_fake_data("2026-11-16 18:51", [])],
                                          last_posted=hour, wait_for_fresh=False)
     assert len(sent) == 1 and logged == []
+
+
+# ── 2026-11-16 layout change: runtime files move from the root into logs/ ───
+def test_migrate_legacy_runtime_files():
+    import tempfile
+    from knyc import paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        logs = root / "logs"
+        files = tuple(logs / f.name for f in paths._RUNTIME_FILES)
+        saved = (paths.ROOT, paths.LOGS_DIR, paths._RUNTIME_FILES)
+        try:
+            paths.ROOT, paths.LOGS_DIR, paths._RUNTIME_FILES = root, logs, files
+            (root / "nowcast_log.csv").write_bytes(b"valid_t\n2026-11-16T20:51:00+00:00\n")
+            (root / "market_log.csv").write_bytes(b"a\n")
+            logs.mkdir()
+            (logs / "market_log.csv").write_bytes(b"newer\n")   # already migrated: keep both
+            moved = paths.migrate_legacy_runtime_files()
+            assert moved == ["nowcast_log.csv"]
+            assert (logs / "nowcast_log.csv").read_bytes().endswith(b"20:51:00+00:00\n")
+            assert not (root / "nowcast_log.csv").exists()
+            assert (root / "market_log.csv").exists()
+            assert (logs / "market_log.csv").read_bytes() == b"newer\n"
+            assert paths.migrate_legacy_runtime_files() == []    # idempotent
+        finally:
+            paths.ROOT, paths.LOGS_DIR, paths._RUNTIME_FILES = saved
 
 
 if __name__ == "__main__":

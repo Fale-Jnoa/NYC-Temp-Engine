@@ -9,8 +9,8 @@ Setup
 2. .env in the same folder:
        DISCORD_TOKEN=...
        GUILD_ID=...
-3. Train models with build_training_data.py + KNYC_Nowcaster.ipynb. They
-   produce:
+3. Train models with knyc/build_training_data.py +
+   notebooks/KNYC_Nowcaster.ipynb. They produce, in models/:
        knyc_model_daily_high.pkl
        knyc_model_t3h.pkl
        knyc_model_t6h.pkl
@@ -37,7 +37,6 @@ import re
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
 from io import StringIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import joblib
@@ -49,18 +48,17 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import tasks
 
-import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
-import kalshi_market as km
-import prediction_tape as tape
-import daily_chart
+from knyc import daily_chart, paths
+from knyc import kalshi_market as km
+from knyc import prediction_tape as tape
+from knyc import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
 
 NY_TZ = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
-LOG_PATH = HERE / "nowcast_log.csv"
+LOG_PATH = paths.NOWCAST_LOG
 # Full Kalshi bracket ladder + prices, one row per contract per hour. Kept
 # separate from nowcast_log.csv (one row per hour) so the two stay joinable on
 # valid_t without either becoming ragged.
-MARKET_LOG_PATH = HERE / "market_log.csv"
+MARKET_LOG_PATH = paths.MARKET_LOG
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,14 +132,14 @@ if not GUILD_ID:
 
 # ── Models & feature manifest ──────────────────────────────────────────────
 log.info("Loading models...")
-model_high = joblib.load(HERE / "knyc_model_daily_high.pkl")
-model_t3h = joblib.load(HERE / "knyc_model_t3h.pkl")
-model_t6h = joblib.load(HERE / "knyc_model_t6h.pkl")
+model_high = joblib.load(paths.MODEL_DAILY_HIGH)
+model_t3h = joblib.load(paths.MODEL_T3H)
+model_t6h = joblib.load(paths.MODEL_T6H)
 
-manifest_path = HERE / "feature_manifest.json"
+manifest_path = paths.FEATURE_MANIFEST
 if not manifest_path.exists():
     raise RuntimeError(
-        "feature_manifest.json missing — re-run KNYC_Nowcaster.ipynb to regenerate."
+        "models/feature_manifest.json missing — re-run notebooks/KNYC_Nowcaster.ipynb to regenerate."
     )
 manifest = json.loads(manifest_path.read_text())
 FEATURE_COLS: list[str] = manifest["feature_cols"]
@@ -519,7 +517,7 @@ def engineer_features(raw: pd.DataFrame, upstream: dict[str, pd.DataFrame]) -> p
 
 
 # ── Climatology (loaded from training data if available) ───────────────────
-clim_path = HERE / "tmpf_climatology.csv"
+clim_path = paths.CLIMATOLOGY
 if clim_path.exists():
     _clim = pd.read_csv(clim_path)
     CLIM_MAP = {(int(r.month), int(r.hour)): float(r.tmpf_clim) for r in _clim.itertuples()}
@@ -970,7 +968,7 @@ SCORE_POST_TIME = dtime(hour=6, minute=30, tzinfo=NY_TZ)
 # Which day's scorecard last went out. Restarts cluster around 06:30 ET (likely
 # unattended-upgrades), and a restart straddling 06:30:00 silently skipped that
 # morning's scorecard. On startup the bot posts any scorecard it missed.
-STATE_PATH = HERE / "bot_state.json"
+STATE_PATH = paths.BOT_STATE
 
 
 def _read_state() -> dict:
@@ -1178,4 +1176,11 @@ async def before_scorecard_loop() -> None:
 
 
 if __name__ == "__main__":
+    # Hosts deployed before 2026-11-16 keep runtime files in the repo root.
+    # Move them into logs/ here (not at import, so tests and tools never touch
+    # a live host's files), then re-read the last logged hour from the new spot.
+    _moved = paths.migrate_legacy_runtime_files()
+    if _moved:
+        log.info("Moved runtime files into logs/: %s", ", ".join(_moved))
+        last_logged_valid = last_posted_valid = _last_logged_valid()
     bot.run(DISCORD_TOKEN)

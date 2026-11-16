@@ -34,10 +34,10 @@ All three models flag the hours at which they are most / least accurate.
 
 Usage
 -----
-    python score_predictions.py                       # scores nowcast_log.csv
-    python score_predictions.py --log other.csv
-    python score_predictions.py --start 2026-07-01 --end 2026-07-14
-    python score_predictions.py --out score_out       # write CSV breakdowns
+    python -m knyc.score_predictions                       # scores nowcast_log.csv
+    python -m knyc.score_predictions --log other.csv
+    python -m knyc.score_predictions --start 2026-07-01 --end 2026-07-14
+    python -m knyc.score_predictions --out score_out       # write CSV breakdowns
 """
 from __future__ import annotations
 
@@ -53,13 +53,14 @@ import numpy as np
 import pandas as pd
 import requests
 
+from knyc import paths
+
 NY_TZ = ZoneInfo("America/New_York")
 # The NWS climate day (CLINYC / DSMNYC) runs midnight-to-midnight LOCAL STANDARD
 # TIME all year, i.e. 01:00-01:00 EDT during daylight saving. Clock times printed
 # in those products are LST too, so they must be read in this fixed offset and
 # only then converted to NY civil time.
 CLIMATE_TZ = timezone(timedelta(hours=-5))
-HERE = Path(__file__).resolve().parent
 STATION = "KNYC"
 HIT_TOL = 1.0  # +/-F for a t+3h / t+6h "hit"
 
@@ -549,7 +550,7 @@ def print_report(daily: pd.DataFrame, dh: dict, s3: dict, s6: dict,
 # ── Main ────────────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser(description="Score logged KNYC nowcaster predictions.")
-    ap.add_argument("--log", default=str(HERE / "nowcast_log.csv"))
+    ap.add_argument("--log", default=str(paths.NOWCAST_LOG))
     ap.add_argument("--start", help="YYYY-MM-DD (NY local) inclusive lower bound")
     ap.add_argument("--end", help="YYYY-MM-DD (NY local) inclusive upper bound")
     ap.add_argument("--out", help="dir to write CSV breakdowns (optional)")

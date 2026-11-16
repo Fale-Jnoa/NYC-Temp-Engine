@@ -1,18 +1,24 @@
-# Training data — large, regenerate with build_training_data.py
-knyc_training.csv
-
 # Secrets
 .env
 
-# Runtime logs — appended live by the bot; keep them per-host so `git pull`
-# on a deployed VM never conflicts with the local prediction history.
-nowcast_log.csv
-market_log.csv
-prediction_tape.csv
+# Training data and pulled server copies — large, regenerate with
+# `python -m knyc.build_training_data`
+data/
 
-# Nowcast analyizer
-analyze_nowcast_log.ipynb
+# Everything the live bot writes (logs, tape, state, chart) — kept per host so
+# `git pull` on a deployed VM never conflicts with its prediction history.
+logs/
+# Pre-2026-11-16 layout kept these in the repo root; the bot moves them into
+# logs/ on its first start after the update.
+/nowcast_log.csv
+/market_log.csv
+/prediction_tape.csv
+/bot_state.json
+/daily_chart.png
+/knyc_training.csv
 
+# Local analysis notebook (large outputs)
+notebooks/analyze_nowcast_log.ipynb
 
 # Python
 __pycache__/
@@ -21,8 +27,5 @@ __pycache__/
 # Backups / scratch
 *.bak
 
-# Bot runtime state (last scorecard date, etc.) - per host
-bot_state.json
-
-# Data pulled down from the production server for review
-server_pull/
+# Local Claude Code settings
+.claude/

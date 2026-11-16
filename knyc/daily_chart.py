@@ -17,15 +17,14 @@ nothing is written to disk. Only the manual command below saves a file.
 
 Usage
 -----
-    python daily_chart.py               # yesterday, saves daily_chart.png to preview
-    python daily_chart.py 2026-09-06
+    python -m knyc.daily_chart               # yesterday, saves daily_chart.png to preview
+    python -m knyc.daily_chart 2026-09-06
 """
 from __future__ import annotations
 
 import io
 import sys
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import matplotlib
@@ -37,7 +36,6 @@ import pandas as pd
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 NY_TZ = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
 
 PREDICTION = "#2a78d6"   # blue
 TEMPERATURE = "#eb6834"  # orange
@@ -188,12 +186,13 @@ def _verdict(pred_vals: np.ndarray, actual_high: float | None) -> str:
 
 
 def main() -> None:
-    import score_predictions as sp
+    from knyc import paths
+    from knyc import score_predictions as sp
 
     target = (pd.to_datetime(sys.argv[1]).date() if len(sys.argv) > 1
               else datetime.now(NY_TZ).date() - timedelta(days=1))
 
-    preds = sp.load_predictions(HERE / "nowcast_log.csv")
+    preds = sp.load_predictions(paths.NOWCAST_LOG)
     preds = preds[preds["local_date"] == target]
     if preds.empty:
         raise SystemExit(f"No predictions logged for {target}.")
@@ -210,7 +209,7 @@ def main() -> None:
     drow = daily[daily["local_date"] == target]
     actual = float(drow.iloc[0]["actual_high"]) if not drow.empty else None
 
-    out = HERE / "daily_chart.png"
+    out = paths.DAILY_CHART_PNG
     out.write_bytes(render(target, preds, obs, actual).getvalue())
     print(f"wrote {out}")
 

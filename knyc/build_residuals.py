@@ -42,8 +42,8 @@ At scoring time the settlement is max(round(re) + k, round(obs)).
 
 Usage
 -----
-    python build_residuals.py --training knyc_training.csv
-    python build_residuals.py --training knyc_training.csv --out residual_model.csv
+    python -m knyc.build_residuals --training data/knyc_training.csv
+    python -m knyc.build_residuals --training data/knyc_training.csv --out models/residual_model.csv
 """
 from __future__ import annotations
 
@@ -58,11 +58,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
-HERE = Path(__file__).resolve().parent
-MANIFEST = HERE / "feature_manifest.json"
-MODEL_PATH = HERE / "knyc_model_daily_high.pkl"
-OUT_PATH = HERE / "residual_model.csv"
-PMF_OUT_PATH = HERE / "offset_pmf.csv"
+from knyc import paths
+
+MANIFEST = paths.FEATURE_MANIFEST
+MODEL_PATH = paths.MODEL_DAILY_HIGH
+OUT_PATH = paths.RESIDUAL_MODEL
+PMF_OUT_PATH = paths.OFFSET_PMF
 
 # NWS climate day = local standard time all year (see score_predictions.CLIMATE_TZ).
 CLIMATE_TZ = timezone(timedelta(hours=-5))
@@ -153,7 +154,7 @@ def compute_residuals(training: Path, manifest: dict) -> pd.DataFrame:
         raise SystemExit(
             f"Only {len(df)} out-of-sample rows. Rebuild the training CSV with a "
             f"range extending well past {train_through:%Y-%m-%d}, e.g.\n"
-            f"    python build_training_data.py --start 2022-01-01"
+            f"    python -m knyc.build_training_data --start 2022-01-01"
         )
 
     model = joblib.load(MODEL_PATH)
@@ -222,7 +223,7 @@ def build_table(res: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build the daily-high residual distribution.")
-    ap.add_argument("--training", default=str(HERE / "knyc_training.csv"),
+    ap.add_argument("--training", default=str(paths.TRAINING_CSV),
                     help="training CSV from build_training_data.py")
     ap.add_argument("--out", default=str(OUT_PATH))
     ap.add_argument("--pmf-out", default=str(PMF_OUT_PATH))
@@ -232,7 +233,7 @@ def main() -> None:
     if not training.exists():
         raise SystemExit(
             f"{training} not found. Generate it first:\n"
-            f"    python build_training_data.py --start 2022-01-01"
+            f"    python -m knyc.build_training_data --start 2022-01-01"
         )
 
     manifest = load_manifest()

@@ -10,15 +10,15 @@ A machine-learning nowcasting system for Central Park, NYC (KNYC). It trains XGB
 | `knyc_model_t3h.pkl` | Temperature 3 hours ahead | **1.30 °F** | +1.39 °F better |
 | `knyc_model_t6h.pkl` | Temperature 6 hours ahead | **2.05 °F** | +2.72 °F better |
 
-Trained on 2010–2021, validated on 2022–2023, tested on 2024 → present (~18k held-out hours). The daily-high model's warm bias is effectively eliminated (+0.05 °F on the test set). "Persistence" is the naive baseline of assuming no change (see [below](#baselines)). Exact feature list and metrics live in [feature_manifest.json](feature_manifest.json).
+Trained on 2010–2021, validated on 2022–2023, tested on 2024 → present (~18k held-out hours). The daily-high model's warm bias is effectively eliminated (+0.05 °F on the test set). "Persistence" is the naive baseline of assuming no change (see [below](#baselines)). Exact feature list and metrics live in [feature_manifest.json](models/feature_manifest.json).
 
 ## How it works
 
-1. **[build_training_data.py](build_training_data.py)** pulls historical KNYC ASOS observations from the IEM archive, along with 8 upstream stations (KEWR, KLGA, KJFK, KTEB, KPHL, KBWI, KDCA, KBOS) for warm/cold-advection signal, and NWS Daily Climate Report (CLINYC) bulletins for the true settled daily high. It engineers features — wind u/v components, cloud oktas, solar zenith/altitude, pressure and temperature tendencies/lags/rolling stats, climatology anomaly, and per-station upstream deltas — and writes `knyc_training.csv` (untracked; regenerate locally).
-2. **[KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb)** trains the three XGBoost models on that data with time-aware splits and sample weighting toward recent years, evaluates them on the held-out test split against naive baselines, and exports the trained `.pkl` models plus [feature_manifest.json](feature_manifest.json) (the exact feature list, upstream stations, and metrics the bot relies on) and [tmpf_climatology.csv](tmpf_climatology.csv).
-3. **[knyc_discord_bot.py](knyc_discord_bot.py)** runs continuously: each hour it fetches the latest KNYC + upstream obs, re-engineers the same features used in training, runs all three models, and posts an embed to a `#predictions` Discord channel with current conditions, t+3h/t+6h forecasts, model daily high, observed high so far, and a floor-locked "reassessed" high (the prediction can't go below what's already been observed, and after 7 PM, once the temperature has dropped 1 °F or more below the observed high, it *is* the observed high). Every posted prediction is logged once to [nowcast_log.csv](nowcast_log.csv).
-4. **[score_predictions.py](score_predictions.py)** grades the logged predictions after the fact against settled ground truth (see [Scoring](#scoring-live-accuracy)).
-5. **[kalshi_market.py](kalshi_market.py)** fetches the live KXHIGHNY bracket ladder and prices, and **[market_scorer.py](market_scorer.py)** grades the daily-high model on trading ROI rather than degrees (see [Scoring against the market](#scoring-against-the-market)).
+1. **[build_training_data.py](knyc/build_training_data.py)** pulls historical KNYC ASOS observations from the IEM archive, along with 8 upstream stations (KEWR, KLGA, KJFK, KTEB, KPHL, KBWI, KDCA, KBOS) for warm/cold-advection signal, and NWS Daily Climate Report (CLINYC) bulletins for the true settled daily high. It engineers features — wind u/v components, cloud oktas, solar zenith/altitude, pressure and temperature tendencies/lags/rolling stats, climatology anomaly, and per-station upstream deltas — and writes `data/knyc_training.csv` (untracked; regenerate locally).
+2. **[KNYC_Nowcaster.ipynb](notebooks/KNYC_Nowcaster.ipynb)** trains the three XGBoost models on that data with time-aware splits and sample weighting toward recent years, evaluates them on the held-out test split against naive baselines, and exports the trained `.pkl` models plus [feature_manifest.json](models/feature_manifest.json) (the exact feature list, upstream stations, and metrics the bot relies on) and [tmpf_climatology.csv](models/tmpf_climatology.csv).
+3. **[knyc_discord_bot.py](knyc_discord_bot.py)** runs continuously: each hour it fetches the latest KNYC + upstream obs, re-engineers the same features used in training, runs all three models, and posts an embed to a `#predictions` Discord channel with current conditions, t+3h/t+6h forecasts, model daily high, observed high so far, and a floor-locked "reassessed" high (the prediction can't go below what's already been observed, and after 7 PM, once the temperature has dropped 1 °F or more below the observed high, it *is* the observed high). Every posted prediction is logged once to `logs/nowcast_log.csv`.
+4. **[score_predictions.py](knyc/score_predictions.py)** grades the logged predictions after the fact against settled ground truth (see [Scoring](#scoring-live-accuracy)).
+5. **[kalshi_market.py](knyc/kalshi_market.py)** fetches the live KXHIGHNY bracket ladder and prices, and **[market_scorer.py](knyc/market_scorer.py)** grades the daily-high model on trading ROI rather than degrees (see [Scoring against the market](#scoring-against-the-market)).
 
 ## Data sources
 
@@ -26,7 +26,7 @@ Trained on 2010–2021, validated on 2022–2023, tested on 2024 → present (~1
 - **IEM ASOS archive** (`mesonet.agron.iastate.edu`) — settled historical hourly obs, used for training and as the scorer's ground-truth temperatures.
 - **NWS CLI bulletins** (CLINYC) — official settled daily high/low. The training target for the daily-high model (with a METAR 6-hr-max fallback), and the scorer's authoritative daily high + the time it occurred.
 - **ASOS DSM** (DSMNYC) — the raw ASOS daily summary max, used by the scorer as an independent cross-check on the CLI high.
-- [tmpf_climatology.csv](tmpf_climatology.csv) — per (month, hour) mean temperature baseline used to compute the temperature-anomaly feature.
+- [tmpf_climatology.csv](models/tmpf_climatology.csv) — per (month, hour) mean temperature baseline used to compute the temperature-anomaly feature.
 
 ### Baselines
 
@@ -41,11 +41,11 @@ A model is only useful insofar as it beats persistence; on the test set all thre
 
 The bot **auto-posts a daily scorecard** to a `#score` channel every morning at **6:30 AM ET**, grading the previous day's predictions. It runs next-morning rather than at midnight because the last few t+3h/t+6h targets of a day fall after midnight and the official CLI high often finalizes overnight — 6:30 AM is the first moment the day is fully settled. Each card shows the actual high (and its source), the daily-high model's pre-high accuracy, and the t+3h/t+6h hit counts.
 
-The same scoring logic is also available as a standalone CLI, [score_predictions.py](score_predictions.py), for grading arbitrary ranges of `nowcast_log.csv` after the fact:
+The same scoring logic is also available as a standalone CLI, [score_predictions.py](knyc/score_predictions.py), for grading arbitrary ranges of `nowcast_log.csv` after the fact:
 
 ```
-python score_predictions.py                          # scores nowcast_log.csv
-python score_predictions.py --start 2026-07-20 --end 2026-08-03 --out score_out
+python -m knyc.score_predictions                          # scores logs/nowcast_log.csv
+python -m knyc.score_predictions --start 2026-07-20 --end 2026-08-03 --out score_out
 ```
 
 Both share the same rules:
@@ -57,12 +57,12 @@ Both share the same rules:
 
 The metrics above measure **degrees**. Kalshi's [KXHIGHNY](https://kalshi.com/markets/kxhighny/highest-temperature-in-nyc) contracts pay on **discrete brackets**, and the two disagree structurally: a 0.4 °F miss that straddles a bracket boundary is a total loss, while a 1.8 °F miss inside a bracket is a clean win. A distance metric cannot tell those apart, so a correct contrarian call at 10:1 odds can score mediocre.
 
-[market_scorer.py](market_scorer.py) grades the daily-high model on money instead:
+[market_scorer.py](knyc/market_scorer.py) grades the daily-high model on money instead:
 
 ```
-python build_residuals.py --training knyc_training.csv   # once, + after retraining
-python market_scorer.py                                  # needs logged prices
-python market_scorer.py --sweep                          # kelly x no-trade-band grid
+python -m knyc.build_residuals --training data/knyc_training.csv   # once, + after retraining
+python -m knyc.market_scorer                                  # needs logged prices
+python -m knyc.market_scorer --sweep                          # kelly x no-trade-band grid
 ```
 
 It reports four things:
@@ -80,14 +80,14 @@ The model has **no edge against the market** at any hour. The market favourite h
 
 ### Bracket probabilities
 
-A point forecast can't say *how sure* it is, so it can't tell a steal from a trap at the same price. [build_residuals.py](build_residuals.py) replays the daily-high model over out-of-sample history and writes [offset_pmf.csv](offset_pmf.csv): the distribution of `settlement − round(max(pred, observed high so far))`, by NY-local hour **and by how far the model sits above the observed high**. Conditioning on the observed high is what makes the evening probabilities honest; the older residual quantiles ([residual_model.csv](residual_model.csv), still written for reference) ignored it and kept putting mass above highs that were already in. Two things matter:
+A point forecast can't say *how sure* it is, so it can't tell a steal from a trap at the same price. [build_residuals.py](knyc/build_residuals.py) replays the daily-high model over out-of-sample history and writes [offset_pmf.csv](models/offset_pmf.csv): the distribution of `settlement − round(max(pred, observed high so far))`, by NY-local hour **and by how far the model sits above the observed high**. Conditioning on the observed high is what makes the evening probabilities honest; the older residual quantiles ([residual_model.csv](models/residual_model.csv), still written for reference) ignored it and kept putting mass above highs that were already in. Two things matter:
 
 - **Out-of-sample only.** Residuals are measured strictly after `feature_manifest.json:train_through`; in-sample residuals look artificially tight and would cause systematic overbetting.
 - **Uncertainty is strongly hour-dependent.** The model's 80% interval spans about **11 °F at midnight** and **3 °F by late afternoon**. Against 2 °F-wide brackets that means an overnight call is spread across ~5 brackets, while a 4 PM call resolves to ~1.5. Early-morning conviction is mostly luck, and Kelly sizing scales positions down accordingly.
 
 ### Data capture
 
-Kalshi's public market API needs no authentication. Each hour the bot appends the full bracket ladder with bid/ask to `market_log.csv`, and one row per prediction to `prediction_tape.csv`:
+Kalshi's public market API needs no authentication. Each hour the bot appends the full bracket ladder with bid/ask to `logs/market_log.csv`, and one row per prediction to `logs/prediction_tape.csv`:
 
 | what the model said | which bracket | what it cost | what settled |
 |---|---|---|---|
@@ -95,11 +95,33 @@ Kalshi's public market API needs no authentication. Each hour the bot appends th
 
 Since **2026-11-16** the tape's bracket is the one containing the **reassessed** high (which respects the observed floor); before that it used the raw model value, which hit 9% of the time after 7 PM. Hit rates and returns are **not comparable across that cut-over**.
 
-Predicted temperatures round **half-up** (88.5 → 89); Python's builtin `round()` is banker's rounding and would send identical-magnitude predictions to different brackets depending on parity. `prediction_tape.py --backfill` stamps the settled high onto past rows, and the 6:30 AM scorecard job does it automatically.
+Predicted temperatures round **half-up** (88.5 → 89); Python's builtin `round()` is banker's rounding and would send identical-magnitude predictions to different brackets depending on parity. `python -m knyc.prediction_tape --backfill` stamps the settled high onto past rows, and the 6:30 AM scorecard job does it automatically.
 
 > **Historical prices cannot be recovered.** Once an event settles the order book is gone — a finalized day returns empty books. Any day the bot is not logging is permanently unscoreable for ROI, which is why capture runs independently of the scorer being finished. Expect ~3 weeks before ROI figures mean anything.
 
 Settlement uses the CLI high **alone** (`settle_high`), not the CLI/DSM blend that `actual_high` uses, because that is the exact value the exchange settles on.
+
+## Repository layout
+
+```
+knyc_discord_bot.py     live bot (entry point; systemd runs this)
+knyc/                   library + command-line tools (run as python -m knyc.<tool>)
+  paths.py              where every file lives
+  score_predictions.py  ground-truth fetchers (CLI/DSM/IEM) and accuracy scoring
+  kalshi_market.py      KXHIGHNY bracket ladder + prices
+  prediction_tape.py    one row per prediction: bracket, price, settlement
+  market_scorer.py      model vs market: ROI, favourite baseline, Brier
+  daily_chart.py        the daily scorecard chart
+  build_training_data.py  training-set builder (IEM + CLI)
+  build_residuals.py    out-of-sample offset PMF for bracket probabilities
+models/                 trained models, feature manifest, climatology, offset PMF
+notebooks/              training notebook (+ local log-analysis notebook)
+tests/                  offline regression tests
+tools/                  feature-parity check (bot vs training)
+docs/                   deployment guide and the 2026-11 production review
+data/                   training CSV, pulled server copies       (gitignored)
+logs/                   everything the bot writes: logs, tape, state (gitignored)
+```
 
 ## Setup
 
@@ -117,10 +139,10 @@ GUILD_ID=...
 ### Rebuild training data and retrain
 
 ```
-python build_training_data.py --start 2010-01-01
+python -m knyc.build_training_data --start 2010-01-01
 ```
 
-This writes `knyc_training.csv` (gitignored). Then run [KNYC_Nowcaster.ipynb](KNYC_Nowcaster.ipynb) end-to-end to retrain and regenerate the three `.pkl` models, `feature_manifest.json`, and `tmpf_climatology.csv`. The bot loads all model artifacts from the repo root and reads the feature list / upstream stations from the manifest at startup, so a retrain with a changed feature set is picked up automatically.
+This writes `data/knyc_training.csv` (gitignored). Then run [KNYC_Nowcaster.ipynb](notebooks/KNYC_Nowcaster.ipynb) end-to-end to retrain and regenerate the three `.pkl` models, `feature_manifest.json`, and `tmpf_climatology.csv` in `models/`. The bot loads all model artifacts from `models/` and reads the feature list / upstream stations from the manifest at startup, so a retrain with a changed feature set is picked up automatically.
 
 ### Run the bot
 
@@ -128,7 +150,7 @@ This writes `knyc_training.csv` (gitignored). Then run [KNYC_Nowcaster.ipynb](KN
 python knyc_discord_bot.py
 ```
 
-Posts one nowcast on startup, then every hour at **:55 UTC** to `#predictions`. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick). Once KNYC is in, it also waits up to **8 minutes** for upstream stations that report later (KPHL, KBWI, KBOS issue at :54) so the model sees this hour's inputs; if one is still missing it posts anyway and says so in the footer. It also posts the daily scorecard to `#score` at 6:30 AM ET (see [Scoring](#scoring-live-accuracy)), and on startup posts any scorecard a restart caused it to miss (tracked in `bot_state.json`). Both channels must exist in the guild.
+Posts one nowcast on startup, then every hour at **:55 UTC** to `#predictions`. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick). Once KNYC is in, it also waits up to **8 minutes** for upstream stations that report later (KPHL, KBWI, KBOS issue at :54) so the model sees this hour's inputs; if one is still missing it posts anyway and says so in the footer. It also posts the daily scorecard to `#score` at 6:30 AM ET (see [Scoring](#scoring-live-accuracy)), and on startup posts any scorecard a restart caused it to miss (tracked in `logs/bot_state.json`). Both channels must exist in the guild.
 
 ### Checks
 

@@ -36,8 +36,8 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DISCORD_TOKEN", "parity-check")
 os.environ.setdefault("GUILD_ID", "1")
 
-import build_training_data as btd  # noqa: E402
 import knyc_discord_bot as bot  # noqa: E402
+from knyc import build_training_data as btd  # noqa: E402
 
 DAYS = 4
 TOL = 1e-6

@@ -23,8 +23,8 @@ Kalshi ever changes the convention, that mismatch is the tripwire.
 
 Usage
 -----
-    python kalshi_market.py              # today's ladder (NY local)
-    python kalshi_market.py 2026-08-11   # a specific date
+    python -m knyc.kalshi_market              # today's ladder (NY local)
+    python -m knyc.kalshi_market 2026-08-11   # a specific date
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from score_predictions import _get  # polite-retry HTTP wrapper
+from knyc.score_predictions import _get  # polite-retry HTTP wrapper
 
 NY_TZ = ZoneInfo("America/New_York")
 SERIES_TICKER = "KXHIGHNY"
