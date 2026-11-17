@@ -171,11 +171,11 @@ def test_obs_features_match_bot():
 def test_all_missing():
     f = g.guidance_features(rows_at(["2026-01-10 12:51"]), g.empty_runs("GFS"), g.empty_runs("LAV"))
     assert f[g.GUIDANCE_COLS].isna().all().all()
-    from xgboost import XGBRegressor
+    import xgboost as xgb   # native API: the server has no scikit-learn
     X = pd.DataFrame(np.random.default_rng(0).normal(size=(200, len(g.GUIDANCE_COLS))),
                      columns=g.GUIDANCE_COLS)
-    m = XGBRegressor(n_estimators=5).fit(X, X.iloc[:, 0])
-    assert np.isfinite(m.predict(f[g.GUIDANCE_COLS])).all()
+    m = xgb.train({"max_depth": 2}, xgb.DMatrix(X, label=X.iloc[:, 0]), num_boost_round=5)
+    assert np.isfinite(m.predict(xgb.DMatrix(f[g.GUIDANCE_COLS]))).all()
 
 
 # Late-bulletin masking steps back exactly one run
