@@ -271,6 +271,77 @@ def test_shadow_row_logged_separately():
     assert "pred_high_cand" not in n.columns          # official log unchanged
 
 
+# ── ASOS daily summary messages raise the observed-high floor ───────────────
+DSM_SAMPLE = """
+CXUS41 KOKX 162115
+DSMNYC
+KNYC DS 1600 16/11 551425/ 400656// 55/ 40//0260048/00/00/00/00/00/
+
+CXUS41 KOKX 162015
+DSMNYC
+KNYC DS 1500 16/11 551425/ 400656// 55/ 40//0260048/00/00/00/00/00/
+
+CXUS41 KOKX 160515
+DSMNYC
+KNYC DS 15/11 491535/ 412359// 49/ 41//9910007/00/00/00/00/00/00/00/
+
+CXUS41 KOKX 150530
+DSMNYC
+KNYC DS COR 10/11 621651/ 480608// 62/ 48//9831606/00/00/00/00/00/00/
+"""
+
+
+def test_dsm_parse():
+    from datetime import datetime, timezone
+    from knyc import dsm
+    now = datetime(2026, 11, 16, 23, 0, tzinfo=timezone.utc)
+    msgs = dsm.parse(DSM_SAMPLE, now)
+    by = {(m["climate_date"].day, m["valid_through_lst"]): m for m in msgs}
+    m15 = by[(16, 15)]
+    assert m15["max_f"] == 55 and m15["issued"] == datetime(2026, 11, 16, 20, 15, tzinfo=timezone.utc)
+    assert m15["max_time"] == datetime(2026, 11, 16, 19, 25, tzinfo=timezone.utc)   # 14:25 LST
+    final = by[(15, None)]
+    assert final["max_f"] == 49 and final["issued"] == datetime(2026, 11, 16, 5, 15, tzinfo=timezone.utc)
+    assert (10, None) not in by          # a 10 Nov correction issued on the 15th is ignored
+    # Only messages already issued count.
+    before = datetime(2026, 11, 16, 20, 10, tzinfo=timezone.utc)
+    assert dsm.max_so_far(msgs, date(2026, 11, 16), before) is None
+    assert dsm.max_so_far(msgs, date(2026, 11, 16), now)["max_f"] == 55
+
+
+def test_combine_obs_high():
+    assert bot.combine_obs_high(53.96, {"max_f": 55.0}) == 55.0
+    assert bot.combine_obs_high(55.4, {"max_f": 55.0}) == 55.4
+    assert bot.combine_obs_high(None, {"max_f": 55.0}) == 55.0
+    assert bot.combine_obs_high(53.96, None) == 53.96
+    assert bot.combine_obs_high(None, None) is None
+
+
+def test_embed_shows_dsm_source():
+    from datetime import datetime, timezone
+    data = _fake_data("2026-11-16 20:51", [])
+    data["obs_high"] = 56.0
+    data["obs_dsm"] = {"max_f": 56.0, "max_time": datetime(2026, 11, 16, 19, 25, tzinfo=timezone.utc)}
+    field = next(f for f in bot.build_embed(data).fields if f.name == "Obs High So Far")
+    assert "56.0" in field.value and "NWS summary, 2:25 PM" in field.value
+
+
+def test_dsm_fetch_failure_keeps_hourly_floor():
+    from datetime import datetime, timezone
+    from knyc import dsm
+    saved = (dsm.fetch_latest, dict(bot._dsm_cache))
+    try:
+        def down(*a, **k):
+            raise ConnectionError("IEM down")
+        dsm.fetch_latest = down
+        bot._dsm_cache.update({"at": None, "msgs": []})
+        assert bot._dsm_max(date(2026, 11, 16), datetime(2026, 11, 16, 21, 0, tzinfo=timezone.utc)) is None
+    finally:
+        dsm.fetch_latest = saved[0]
+        bot._dsm_cache.clear()
+        bot._dsm_cache.update(saved[1])
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

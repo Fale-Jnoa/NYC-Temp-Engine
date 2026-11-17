@@ -50,6 +50,7 @@ from discord.ext import tasks
 
 from knyc import candidate as candidate_mod
 from knyc import daily_chart, paths
+from knyc import dsm as dsm_mod
 from knyc import kalshi_market as km
 from knyc import prediction_tape as tape
 from knyc import score_predictions as scorer  # reuse the offline scorer's fetch + scoring
@@ -587,6 +588,31 @@ def _observed_high(df: pd.DataFrame, climate_date) -> float | None:
     return max(candidates) if candidates else None
 
 
+# ASOS daily summary messages (~20:15Z and ~21:15Z): the official max so far,
+# which the hourly METARs miss on most afternoons. Cached; any failure just
+# leaves the hourly floor in place.
+DSM_CACHE_TTL = timedelta(minutes=10)
+_dsm_cache: dict = {"at": None, "msgs": []}
+
+
+def _dsm_max(climate_date, now_utc: datetime | None = None) -> dict | None:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    at = _dsm_cache["at"]
+    if at is None or now_utc - at > DSM_CACHE_TTL:
+        try:
+            _dsm_cache["msgs"] = dsm_mod.fetch_latest(now_utc)
+        except Exception as exc:  # noqa: BLE001 - never block a post
+            log.warning("DSM fetch failed: %s", exc)
+        _dsm_cache["at"] = now_utc
+    return dsm_mod.max_so_far(_dsm_cache["msgs"], climate_date, now_utc)
+
+
+def combine_obs_high(hourly: float | None, dsm: dict | None) -> float | None:
+    """Observed-high floor: hourly METARs and 6-h groups, raised to the DSM max."""
+    vals = [v for v in (hourly, dsm["max_f"] if dsm else None) if v is not None]
+    return max(vals) if vals else None
+
+
 def reassess_high(pred_high: float, obs_high: float | None, cur_temp: float,
                   local_hour: int) -> float:
     """Best single estimate of the day's high.
@@ -673,7 +699,10 @@ def compute_nowcast() -> dict:
     # today_local (NY civil date) names the Kalshi event; the floor itself is
     # taken over the LST climate day of that date (see CLIMATE_TZ).
     today_local = datetime.now(NY_TZ).date()
-    obs_high = _observed_high(df, today_local)
+    obs_high_hourly = _observed_high(df, today_local)
+    dsm = _dsm_max(today_local)
+    obs_high = combine_obs_high(obs_high_hourly, dsm)
+    obs_from_dsm = dsm is not None and (obs_high_hourly is None or dsm["max_f"] > obs_high_hourly)
     local_hour = valid_t.astimezone(NY_TZ).hour
     reassessed = reassess_high(pred_high, obs_high, cur_temp, local_hour)
 
@@ -692,10 +721,11 @@ def compute_nowcast() -> dict:
 
     log.info(
         "valid=%s temp=%.1f t3h=%.1f t6h=%.1f high=%.1f obs_high=%s reassessed=%.1f "
-        "age=%s stale_upstream=%s",
+        "age=%s stale_upstream=%s dsm=%s",
         valid_t.isoformat(), cur_temp, pred_t3h, pred_t6h, pred_high,
         f"{obs_high:.1f}" if obs_high is not None else "-",
         reassessed, age, ",".join(stale_upstream) or "-",
+        f"{dsm['max_f']:.0f}@{dsm['max_time'].astimezone(NY_TZ):%H:%M}" if dsm else "-",
     )
 
     return {
@@ -710,6 +740,8 @@ def compute_nowcast() -> dict:
         "pred_t6h": pred_t6h,
         "pred_high": pred_high,
         "obs_high": obs_high,
+        "obs_high_hourly": obs_high_hourly,
+        "obs_dsm": dsm if obs_from_dsm else None,
         "reassessed": reassessed,
         "degraded": degraded,
         "stale_upstream": stale_upstream,
@@ -808,6 +840,9 @@ def build_embed(data: dict) -> discord.Embed:
     color = _temp_color(data["reassessed"])
     obs_ts = data["valid_t"].astimezone(NY_TZ).strftime("%H:%M %Z")
     obs_str = f"{data['obs_high']:.1f}°F" if data["obs_high"] is not None else "—"
+    if data.get("obs_dsm"):
+        t = data["obs_dsm"]["max_time"].astimezone(NY_TZ).strftime("%I:%M %p").lstrip("0")
+        obs_str += f"\n*(NWS summary, {t})*"
     obs_note = (
         "\n*(obs exceeded model)*"
         if data["obs_high"] is not None and data["obs_high"] > data["pred_high"]
