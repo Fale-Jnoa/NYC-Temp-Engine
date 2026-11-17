@@ -22,6 +22,7 @@ os.environ.setdefault("GUILD_ID", "1")
 from knyc import guidance as g  # noqa: E402
 
 H = pd.Timedelta(hours=1)
+GFS_LEADS = [*range(6, 61, 3), 66, 72]
 
 
 def synth_gfs(start: str, days: int) -> pd.DataFrame:
@@ -32,7 +33,7 @@ def synth_gfs(start: str, days: int) -> pd.DataFrame:
     rows = []
     for i, rt in enumerate(pd.date_range(start, periods=days * 4, freq="6h", tz="UTC")):
         nx_leads = {24, 36, 48, 60, 72} if rt.hour in (0, 12) else {18, 30, 42, 54, 66}
-        for L in g.GFS_LEADS.astype(int):
+        for L in GFS_LEADS:
             ft = rt + L * H
             nx = (70.0 + i if ft.hour == 0 else 30.0 + i) if L in nx_leads else np.nan
             rows.append({"runtime": rt, "ftime": ft, "lead": L,
@@ -182,6 +183,55 @@ def test_skip_newest():
     f = feats(["2026-01-10 17:51"], skip_newest=True).iloc[0]
     assert f["gfs_tmp_runtime"] == pd.Timestamp("2026-01-10 06:00", tz="UTC")
     assert f["lav_runtime"] == pd.Timestamp("2026-01-10 06:00", tz="UTC")
+
+
+# ── NBM (NBS) ───────────────────────────────────────────────────────────────
+def synth_nbs(start: str, days: int, cycles=(1, 7, 13, 19)) -> pd.DataFrame:
+    """NBS-like runs: 3-hourly ftimes on the 00/03/.. grid, so a 01Z run's
+    first lead is 5 h; max/min in `txn` (post-2021 name). tmp = 60 + i/10 + L/100."""
+    rows = []
+    rts = [rt for rt in pd.date_range(start, periods=days * 24, freq="1h", tz="UTC") if rt.hour in cycles]
+    for i, rt in enumerate(rts):
+        first = rt.ceil("3h") + 3 * H if rt.ceil("3h") - rt < 3 * H else rt.ceil("3h")
+        for k in range(23):
+            ft = first + 3 * k * H
+            rows.append({"runtime": rt, "ftime": ft, "tmp": 60 + i / 10 + ((ft - rt) / H) / 100,
+                         "txn": (80.0 + i) if ft.hour == 0 else (20.0 + i) if ft.hour == 12 else np.nan})
+    return pd.DataFrame(rows)
+
+
+NBS = g.clean_runs(synth_nbs("2026-01-08", 6).astype({"runtime": str, "ftime": str}), "NBS")
+
+
+def test_nbs_clean_and_select():
+    assert set(NBS["runtime"].dt.hour) == {1, 7, 13, 19}
+    assert NBS.groupby("runtime")["lead"].min().isin([5, 6]).all()
+    assert NBS["n_x"].notna().any()                      # txn -> n_x
+    t = pd.Timestamp("2026-01-10 17:51", tz="UTC")      # 13Z + 3h lag = 16Z <= 17:51
+    f = g.guidance_features(rows_at([t]), GFS, LAV, NBS).iloc[0]
+    assert f["nbs_tmp_runtime"] == pd.Timestamp("2026-01-10 13:00", tz="UTC")
+    assert (f["nbs_tmp_runtime"] + g.NBS_AVAIL_LAG) <= t
+    # 13Z Jan 10 is run index 2*4 + 2 = 10. t3 at 20:51Z = lead 7.85 h,
+    # between the 18Z (lead 5) and 21Z (lead 8) rows -> linear.
+    assert abs(f["nbs_tmp_t3"] - (60 + 1.0 + 7.85 / 100)) < 1e-9
+    # n_x for Jan 10 = value at Jan 11 00Z from the latest eligible run (13Z Jan 10).
+    assert f["nbs_nx_today"] == 80.0 + 10 and f["nbs_nx_runtime"].hour == 13
+    # GFS / LAMP columns are unaffected by adding NBS.
+    pd.testing.assert_frame_equal(
+        g.guidance_features(rows_at([t]), GFS, LAV)[g.GFS_COLS + g.LAV_COLS],
+        g.guidance_features(rows_at([t]), GFS, LAV, NBS)[g.GFS_COLS + g.LAV_COLS])
+
+
+def test_nbs_no_leakage():
+    rng = np.random.default_rng(3)
+    base = pd.Timestamp("2026-01-09 00:51", tz="UTC")
+    times = [base + int(h) * H for h in rng.integers(0, 4 * 24, 1000)]
+    f = g.guidance_features(rows_at(times), GFS, LAV, NBS)
+    v = pd.to_datetime(times, utc=True)
+    for col in ("nbs_nx_runtime", "nbs_tmp_runtime"):
+        rt = pd.DatetimeIndex(f[col])
+        ok = rt.notna()
+        assert ok.mean() > 0.9 and ((rt[ok] + g.NBS_AVAIL_LAG) <= v[ok]).all(), col
 
 
 if __name__ == "__main__":

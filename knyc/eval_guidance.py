@@ -3,10 +3,12 @@ Evaluate the guidance candidate against production and the Kalshi market and
 apply the go/no-go gate (docs/PLAN_GUIDANCE_RETRAIN.md section 6). Writes
 GATE_REPORT.md and gate.json into the candidate directory.
 
-    python -m knyc.eval_guidance
+    python -m knyc.eval_guidance                          # guidance_v1
+    python -m knyc.eval_guidance --candidate guidance_v2
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import subprocess
@@ -20,7 +22,7 @@ from knyc import guidance as g
 from knyc import market_scorer as ms
 from knyc import paths
 from knyc.build_residuals import build_offset_pmf
-from knyc.train_guidance import (OUT_DIR, apply_climatology, load_dataset,
+from knyc.train_guidance import (apply_climatology, load_dataset,
                                  production_climatology, production_manifest)
 
 BLOCKS = ms.HOUR_BLOCKS
@@ -97,6 +99,9 @@ def regress(df: pd.DataFrame, hours: tuple[int, int], cols: list[str]) -> dict:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--candidate", default="guidance_v1")
+    OUT_DIR = paths.CANDIDATES_DIR / ap.parse_args().candidate
     cman = json.loads((OUT_DIR / "feature_manifest.json").read_text())
     ccols = cman["feature_cols"]
     cand = joblib.load(OUT_DIR / "knyc_model_daily_high.pkl")
@@ -110,10 +115,13 @@ def main() -> None:
     dc, dp = apply_climatology(df, cclim), apply_climatology(df, pclim)
     df["pred_cand"] = cand.predict(dc[ccols])
     df["pred_prod"] = prod.predict(dp[pcols])
-    for name, cols in (("gfs_off", g.GFS_COLS), ("lav_off", g.LAV_COLS), ("both_off", g.GUIDANCE_COLS)):
+    sources = [s for s, cols in g.SOURCE_COLS.items() if any(c in ccols for c in cols)]
+    off_sets = [(f"{s.lower()}_off", g.SOURCE_COLS[s]) for s in sources] + [("all_off", g.GUIDANCE_COLS)]
+    for name, cols in off_sets:
         x = dc[ccols].copy()
         x[[c for c in cols if c in ccols]] = np.nan
         df[f"pred_{name}"] = cand.predict(x)
+    raw_nx = [c for c in ("gfs_nx_today", "nbs_nx_today") if c in ccols]
     df["re_cand"] = reassess(df["pred_cand"], df["obs_high_so_far"], df["tmpf"], df["local_hour"])
     df["re_prod"] = reassess(df["pred_prod"], df["obs_high_so_far"], df["tmpf"], df["local_hour"])
     report, gate = [], {}
@@ -126,8 +134,8 @@ def main() -> None:
     test = df[(df["split"] == "test") & df["target_high"].notna()]
     t = mae_table(test, {"cand": "pred_cand", "prod": "pred_prod", "gfs_nx": "gfs_nx_today",
                          "re_cand": "re_cand", "re_prod": "re_prod",
-                         "gfs_off": "pred_gfs_off", "lav_off": "pred_lav_off",
-                         "both_off": "pred_both_off"}, "target_high")
+                         **{c.split("_")[0] + "_raw": c for c in raw_nx},
+                         **{name: f"pred_{name}" for name, _ in off_sets}}, "target_high")
     p(f"# Gate report: {cman['candidate']} (variant {cman['variant']})")
     p()
     p(f"## 6.1 Test period {cman['test'][0]} to {cman['test'][1]} ({test['local_date'].nunique()} days, {len(test):,} rows)")
@@ -140,27 +148,35 @@ def main() -> None:
     red = 1 - t["cand_mae"] / t["prod_mae"]
     g1 = bool(red["00-05"] >= 0.20 and red["06-09"] >= 0.20 and red["10-12"] >= 0.10
               and all(t.loc[b, "cand_mae"] <= t.loc[b, "prod_mae"] + 0.03 for b in ("13-15", "16-18", "19-23")))
-    h09 = test[test["local_hour"] <= 9].dropna(subset=["gfs_nx_today"])
-    g1b_c, g1b_g = (h09["pred_cand"] - h09["target_high"]).abs().mean(), (h09["gfs_nx_today"] - h09["target_high"]).abs().mean()
+    h09 = test[test["local_hour"] <= 9].dropna(subset=raw_nx)
+    g1b_c = (h09["pred_cand"] - h09["target_high"]).abs().mean()
+    raw_mae = {c: float((h09[c] - h09["target_high"]).abs().mean()) for c in raw_nx}
+    best_raw = min(raw_mae, key=raw_mae.get)
+    g1b_g = raw_mae[best_raw]
     g1b = bool(g1b_c <= g1b_g - 0.15)
     gate["G1"] = {"pass": g1, "reduction": {b: float(v) for b, v in red.items()}}
-    gate["G1b"] = {"pass": g1b, "candidate_h0_9": float(g1b_c), "gfs_nx_h0_9": float(g1b_g)}
+    gate["G1b"] = {"pass": g1b, "candidate_h0_9": float(g1b_c), "raw_h0_9": raw_mae, "best_raw": best_raw}
     p()
     p(f"G1 (>=20% lower 00-05 and 06-09, >=10% 10-12, <=+0.03 F later): **{'PASS' if g1 else 'FAIL'}**")
-    p(f"G1b (hours 0-9: candidate {g1b_c:.2f} vs raw GFS n_x {g1b_g:.2f}, needs >= 0.15 lower): **{'PASS' if g1b else 'FAIL'}**")
+    p(f"G1b (hours 0-9: candidate {g1b_c:.2f} vs best raw guidance max ({best_raw}) {g1b_g:.2f}, "
+      f"needs >= 0.15 lower): **{'PASS' if g1b else 'FAIL'}**")
+    if "nbs_raw_mae" in t:
+        p(f"(raw NBM n_x MAE by block: {', '.join(f'{b} {v:.2f}' for b, v in t['nbs_raw_mae'].items())})")
 
     # ── 6.4 Degradation ────────────────────────────────────────────────────
     p()
     p("## 6.4 Degradation (test period, guidance forced missing)")
     p()
-    p("| Block | Production | GFS missing | LAMP missing | Both missing |")
-    p("|---|---|---|---|---|")
+    labels = {"gfs_off": "GFS missing", "lav_off": "LAMP missing", "nbs_off": "NBM missing",
+              "all_off": "All guidance missing"}
+    p("| Block | Candidate | Production | " + " | ".join(labels[n] for n, _ in off_sets) + " |")
+    p("|---|---|---|" + "---|" * len(off_sets))
     for b, r in t.iterrows():
-        p(f"| {b} | {r.prod_mae:.2f} | {r.gfs_off_mae:.2f} | {r.lav_off_mae:.2f} | {r.both_off_mae:.2f} |")
-    g4 = bool((t["both_off_mae"] <= t["prod_mae"] + 0.15).all())
-    gate["G4"] = {"pass": g4, "worst_excess": float((t["both_off_mae"] - t["prod_mae"]).max())}
+        p(f"| {b} | {r.cand_mae:.2f} | {r.prod_mae:.2f} | " + " | ".join(f"{r[f'{n}_mae']:.2f}" for n, _ in off_sets) + " |")
+    g4 = bool((t["all_off_mae"] <= t["prod_mae"] + 0.15).all())
+    gate["G4"] = {"pass": g4, "worst_excess": float((t["all_off_mae"] - t["prod_mae"]).max())}
     p()
-    p(f"G4 (both missing within 0.15 F of production in every block): **{'PASS' if g4 else 'FAIL'}**")
+    p(f"G4 (all guidance missing within 0.15 F of production in every block): **{'PASS' if g4 else 'FAIL'}**")
 
     # ── 6.2 Live holdout ───────────────────────────────────────────────────
     mlog = paths.SERVER_PULL_DIR / "market_log.csv"

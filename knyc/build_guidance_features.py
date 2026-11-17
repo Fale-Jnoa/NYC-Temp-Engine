@@ -1,5 +1,5 @@
 """
-Compute the 15 guidance-retrain features for every training row and write
+Compute the guidance-retrain features (GFS MOS, LAMP, NBM + observation) for every training row and write
 data/guidance/guidance_features.csv keyed by `valid`. The training CSV itself
 is not rewritten.
 
@@ -46,12 +46,13 @@ def load_rows(columns: list[str] | None = None) -> pd.DataFrame:
 def main() -> None:
     rows = load_rows(["valid", "tmpf", "mxtmpf_6hr", "target_high"])
     print(f"rows: {len(rows):,}  {rows.valid.min()} -> {rows.valid.max()}")
-    gfs, lav = load_runs("GFS"), load_runs("LAV")
-    print(f"GFS runs {gfs.runtime.nunique():,}, LAMP runs {lav.runtime.nunique():,}")
+    gfs, lav, nbs = load_runs("GFS"), load_runs("LAV"), load_runs("NBS")
+    print(f"GFS runs {gfs.runtime.nunique():,}, LAMP runs {lav.runtime.nunique():,}, "
+          f"NBM runs {nbs.runtime.nunique():,}")
 
     out = pd.concat([rows[["valid"]], g.obs_day_features(rows),
-                     g.guidance_features(rows, gfs, lav)], axis=1)
-    late = g.guidance_features(rows, gfs, lav, skip_newest=True)[g.GUIDANCE_COLS]
+                     g.guidance_features(rows, gfs, lav, nbs)], axis=1)
+    late = g.guidance_features(rows, gfs, lav, nbs, skip_newest=True)[g.GUIDANCE_COLS]
     out = pd.concat([out, late.add_prefix("late_")], axis=1)
 
     paths.GUIDANCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,6 +69,8 @@ def main() -> None:
         "gfs_nx_today non-null (>= 99%)": nx.notna().mean(),
         "LAMP non-null after 2020-07-12 outside 2023 gap (>= 95%)": out.loc[lav_era, "lav_tmp_t3"].notna().mean(),
         "MAE gfs_nx_today vs target 2022+ (2.0-2.4 F)": float((nx - t)[recent].abs().mean()),
+        "MAE nbs_nx_today vs target 2022+": float((out["nbs_nx_today"] - t)[recent].abs().mean()),
+        "NBS non-null after 2019-01-01": out.loc[rows["valid"] >= "2019-01-01", "nbs_tmp_t3"].notna().mean(),
         "obs_high_so_far <= target + 1 (>= 99%)": ok_obs[t.notna()].mean(),
     }
     for k, v in checks.items():

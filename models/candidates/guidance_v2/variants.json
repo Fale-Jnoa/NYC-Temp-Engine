@@ -1,0 +1,21 @@
+{
+  "selected": "D1 (pre-registered)",
+  "variants": {
+    "D1": {
+      "train_rows": 96849,
+      "best_iteration": 1026,
+      "val_mae": 1.2350593159770722,
+      "val_mae_h0_12": 1.7574004853092924,
+      "val_mae_all_guidance_missing": 1.8445239708267993,
+      "role": "candidate (pre-registered)"
+    },
+    "D2": {
+      "train_rows": 33907,
+      "best_iteration": 489,
+      "val_mae": 1.209414653891256,
+      "val_mae_h0_12": 1.6245255193896728,
+      "val_mae_all_guidance_missing": 2.2565211617673784,
+      "role": "informational only"
+    }
+  }
+}

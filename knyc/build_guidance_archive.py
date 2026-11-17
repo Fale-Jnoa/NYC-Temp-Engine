@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from knyc import guidance, paths
 
-FIRST_YEAR = {"GFS": 2004, "LAV": 2020}
+FIRST_YEAR = {"GFS": 2004, "LAV": 2020, "NBS": 2018}
 
 
 def main() -> None:
