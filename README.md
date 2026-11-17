@@ -152,6 +152,10 @@ python knyc_discord_bot.py
 
 Posts one nowcast on startup, then every hour at **:55 UTC** to `#predictions`. KNYC's METAR typically lands ~:51–:53 via the aviationweather.gov feed; if a fresh ob hasn't arrived by post time, the bot retries every 60 s until a newer METAR appears (capped at 50 min so a dead feed can't stall the next hourly tick). Once KNYC is in, it also waits up to **8 minutes** for upstream stations that report later (KPHL, KBWI, KBOS issue at :54) so the model sees this hour's inputs; if one is still missing it posts anyway and says so in the footer. It also posts the daily scorecard to `#score` at 6:30 AM ET (see [Scoring](#scoring-live-accuracy)), and on startup posts any scorecard a restart caused it to miss (tracked in `logs/bot_state.json`). Both channels must exist in the guild.
 
+### Side-by-side trial: guidance_v2
+
+Since 2026-11-16 each post also shows **🧪 v2 High (trial)**: a candidate model that adds NWS forecast guidance (GFS MOS, LAMP and the National Blend of Models, fetched hourly from IEM) to the same observations. The current model stays official for the nowcast log, the Kalshi tape and the scorecard; v2 is logged separately to `logs/shadow_log.csv`. If no guidance can be fetched, v2 repeats the current model's number and says so. Set `KNYC_SHADOW_CANDIDATE=off` in `.env` to turn it off. Compare the two with `python -m knyc.shadow_report`. Background and gate results: [docs/PLAN_GUIDANCE_V2.md](docs/PLAN_GUIDANCE_V2.md), [models/candidates/guidance_v2/GATE_REPORT.md](models/candidates/guidance_v2/GATE_REPORT.md).
+
 ### Checks
 
 ```

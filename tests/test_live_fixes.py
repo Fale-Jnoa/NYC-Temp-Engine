@@ -212,6 +212,65 @@ def test_migrate_legacy_runtime_files():
             paths.ROOT, paths.LOGS_DIR, paths._RUNTIME_FILES = saved
 
 
+# ── Side-by-side v2 trial (docs/PLAN_GUIDANCE_V2.md) ────────────────────────
+def _candidate_frame(cand) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """48 hourly rows carrying every production feature (values arbitrary)."""
+    rng = np.random.default_rng(0)
+    v = pd.date_range("2026-11-15 00:51", periods=48, freq="1h", tz="UTC")
+    df = pd.DataFrame({c: rng.normal(50, 5, len(v)) for c in bot.FEATURE_COLS})
+    df["valid"] = v
+    df["tmpf"] = 50 + rng.normal(0, 3, len(v))
+    df["mxtmpf_6hr"] = np.nan
+    df["month"], df["hour"] = 11, v.tz_convert("America/New_York").hour
+    return df, v[-1]
+
+
+def test_candidate_falls_back_when_guidance_down():
+    from knyc import candidate as cm
+    from knyc import guidance as g
+    cand = cm.load("guidance_v2")
+    if cand is None:
+        print("  (skipped: guidance_v2 artifacts not present)")
+        return
+    df, t = _candidate_frame(cand)
+    prod = {"pred_high": 61.0, "pred_t3h": 50.0, "pred_t6h": 48.0}
+    saved = g.fetch_runs
+    try:
+        def down(*a, **k):
+            raise ConnectionError("IEM down")
+        g.fetch_runs = down
+        cm.FAIL_TTL_S = 0
+        out = cand.predict(df, t, prod)
+    finally:
+        g.fetch_runs = saved
+    assert out["fallback"] and out["pred_high"] == 61.0 and out["sources_ok"] == "-"
+    assert "IEM down" in out["fetch_errors"]
+
+
+def test_shadow_row_logged_separately():
+    import tempfile
+    from knyc import kalshi_market as km
+    from knyc import paths
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        saved = (bot.LOG_PATH, bot.MARKET_LOG_PATH, paths.SHADOW_LOG, km.fetch_brackets)
+        try:
+            bot.LOG_PATH, bot.MARKET_LOG_PATH = tmp / "nowcast_log.csv", tmp / "market_log.csv"
+            paths.SHADOW_LOG = tmp / "shadow_log.csv"
+            km.fetch_brackets = lambda d: pd.DataFrame()
+            data = _fake_data("2026-11-16 18:51", [])
+            data["shadow"] = {"candidate": "guidance_v2", "pred_high": 56.2, "reassessed": 56.2,
+                              "pred_t3h": 51.0, "pred_t6h": 48.5, "fallback": False,
+                              "sources_ok": "GFS,LAV,NBS", "fetch_errors": "", "gfs_nx_today": 56.0}
+            bot.log_nowcast(data)
+            s = pd.read_csv(paths.SHADOW_LOG)
+            n = pd.read_csv(bot.LOG_PATH)
+        finally:
+            bot.LOG_PATH, bot.MARKET_LOG_PATH, paths.SHADOW_LOG, km.fetch_brackets = saved
+    assert len(s) == 1 and s["pred_high_cand"].iloc[0] == 56.2 and s["pred_high_prod"].iloc[0] == 55.0
+    assert "pred_high_cand" not in n.columns          # official log unchanged
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

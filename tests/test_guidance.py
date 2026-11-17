@@ -234,6 +234,25 @@ def test_nbs_no_leakage():
         assert ok.mean() > 0.9 and ((rt[ok] + g.NBS_AVAIL_LAG) <= v[ok]).all(), col
 
 
+# pandas 3 parses datetimes to microseconds; features must not depend on unit.
+def test_datetime_unit_independent():
+    times = [f"2026-01-10 {h:02d}:51" for h in range(0, 24, 2)]
+    ref = g.guidance_features(rows_at(times), GFS, LAV, NBS)
+
+    def as_unit(df, unit):
+        d = df.copy()
+        for c in ("runtime", "ftime"):
+            d[c] = d[c].astype(f"datetime64[{unit}, UTC]")
+        return d
+
+    for unit in ("us", "s"):
+        rows = rows_at(times)
+        rows["valid"] = rows["valid"].astype(f"datetime64[{unit}, UTC]")
+        got = g.guidance_features(rows, as_unit(GFS, unit), as_unit(LAV, unit), as_unit(NBS, unit))
+        cols = g.GUIDANCE_COLS
+        np.testing.assert_allclose(got[cols].to_numpy(float), ref[cols].to_numpy(float), equal_nan=True)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

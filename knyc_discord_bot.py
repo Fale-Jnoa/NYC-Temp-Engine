@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import tasks
 
+from knyc import candidate as candidate_mod
 from knyc import daily_chart, paths
 from knyc import kalshi_market as km
 from knyc import prediction_tape as tape
@@ -68,10 +69,11 @@ logging.basicConfig(
 log = logging.getLogger("knyc-nowcaster")
 
 
-def _last_log_line() -> str | None:
+def _last_log_line(path=None) -> str | None:
     """The last data row already in the log, or None if the file is empty."""
+    path = path or LOG_PATH
     try:
-        with open(LOG_PATH, "r", newline="") as fh:
+        with open(path, "r", newline="") as fh:
             last = None
             for last in fh:
                 pass
@@ -80,8 +82,9 @@ def _last_log_line() -> str | None:
         return None
 
 
-def _append_log_row(row: dict) -> None:
-    """Append one row to LOG_PATH, aligned to the file's existing header.
+def _append_log_row(row: dict, path=None) -> None:
+    """Append one row to `path` (default LOG_PATH), aligned to the file's
+    existing header.
 
     feature_manifest.json can gain or lose upstream stations between runs; a
     plain mode="a" append would write the new column set under the stale
@@ -95,23 +98,24 @@ def _append_log_row(row: dict) -> None:
     duplicate on every boot. A retry that actually moved the prediction
     (upstream obs landed mid-wait) still differs, so it is still written.
     """
-    if not LOG_PATH.exists():
-        pd.DataFrame([row]).to_csv(LOG_PATH, index=False)
+    path = path or LOG_PATH
+    if not path.exists():
+        pd.DataFrame([row]).to_csv(path, index=False)
         return
 
-    header = pd.read_csv(LOG_PATH, nrows=0).columns.tolist()
+    header = pd.read_csv(path, nrows=0).columns.tolist()
     extra = [c for c in row if c not in header]
     if extra:
-        log.warning("nowcast log header lacks %d current column(s), dropping: %s",
-                    len(extra), ", ".join(extra))
+        log.warning("%s header lacks %d current column(s), dropping: %s",
+                    path.name, len(extra), ", ".join(extra))
 
     line = (pd.DataFrame([row]).reindex(columns=header)
               .to_csv(header=False, index=False, lineterminator="\n").strip())
-    if line == _last_log_line():
-        log.debug("nowcast log row unchanged — skipping duplicate write")
+    if line == _last_log_line(path):
+        log.debug("%s row unchanged — skipping duplicate write", path.name)
         return
 
-    with open(LOG_PATH, "a", newline="") as fh:
+    with open(path, "a", newline="") as fh:
         fh.write(line + "\n")
 
 
@@ -142,6 +146,12 @@ if not manifest_path.exists():
         "models/feature_manifest.json missing — re-run notebooks/KNYC_Nowcaster.ipynb to regenerate."
     )
 manifest = json.loads(manifest_path.read_text())
+
+# Side-by-side trial model (docs/PLAN_GUIDANCE_V2.md). Shown next to the
+# official prediction and logged to logs/shadow_log.csv; never used for the
+# nowcast log, the Kalshi tape or the scorecard. KNYC_SHADOW_CANDIDATE=off
+# in .env disables it.
+SHADOW = candidate_mod.load(os.getenv("KNYC_SHADOW_CANDIDATE", "guidance_v2"))
 FEATURE_COLS: list[str] = manifest["feature_cols"]
 UPSTREAM: list[str] = manifest["upstream_stations"]
 
@@ -667,6 +677,19 @@ def compute_nowcast() -> dict:
     local_hour = valid_t.astimezone(NY_TZ).hour
     reassessed = reassess_high(pred_high, obs_high, cur_temp, local_hour)
 
+    shadow = None
+    if SHADOW is not None:
+        try:
+            shadow = SHADOW.predict(df, valid_t, {"pred_high": pred_high, "pred_t3h": pred_t3h,
+                                                  "pred_t6h": pred_t6h})
+            shadow["reassessed"] = reassess_high(shadow["pred_high"], obs_high, cur_temp, local_hour)
+            log.info("candidate %s: high=%.1f reassessed=%.1f sources=%s%s", shadow["candidate"],
+                     shadow["pred_high"], shadow["reassessed"], shadow["sources_ok"],
+                     " (FALLBACK to production)" if shadow["fallback"] else "")
+        except Exception as exc:  # noqa: BLE001 - the trial must never stop a post
+            log.warning("candidate prediction failed: %s", exc)
+            shadow = None
+
     log.info(
         "valid=%s temp=%.1f t3h=%.1f t6h=%.1f high=%.1f obs_high=%s reassessed=%.1f "
         "age=%s stale_upstream=%s",
@@ -691,6 +714,7 @@ def compute_nowcast() -> dict:
         "degraded": degraded,
         "stale_upstream": stale_upstream,
         "features": X.iloc[0].to_dict(),
+        "shadow": shadow,
     }
 
 
@@ -707,6 +731,23 @@ def log_nowcast(data: dict) -> None:
         _append_log_row(row)
     except Exception as exc:
         log.warning("nowcast log write failed: %s", exc)
+
+    shadow = data.get("shadow")
+    if shadow:
+        try:
+            srow = {"valid_t": valid_t.isoformat(),
+                    "local_hour": valid_t.astimezone(NY_TZ).hour,
+                    "cur_temp": data["cur_temp"], "obs_high": data["obs_high"],
+                    "pred_high_prod": data["pred_high"], "reassessed_prod": data["reassessed"],
+                    "pred_t3h_prod": data["pred_t3h"], "pred_t6h_prod": data["pred_t6h"],
+                    "candidate": shadow["candidate"],
+                    "pred_high_cand": shadow["pred_high"], "reassessed_cand": shadow["reassessed"],
+                    "pred_t3h_cand": shadow["pred_t3h"], "pred_t6h_cand": shadow["pred_t6h"],
+                    **{k: v for k, v in shadow.items()
+                       if k not in ("candidate", "pred_high", "reassessed", "pred_t3h", "pred_t6h")}}
+            _append_log_row(srow, path=paths.SHADOW_LOG)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shadow log write failed: %s", exc)
 
     # Kalshi bracket prices at this exact hour. Historical prices cannot be
     # recovered after the fact — the order book is gone once the event settles —
@@ -797,7 +838,15 @@ def build_embed(data: dict) -> discord.Embed:
         value=f"**{data['reassessed']:.1f}°F**{obs_note}",
         inline=True,
     )
+    shadow = data.get("shadow")
+    if shadow:
+        note = ("\n*(no forecast data: same as current)*" if shadow["fallback"]
+                else f"\n*(model {shadow['pred_high']:.1f}°F)*")
+        embed.add_field(name="🧪 v2 High (trial)", value=f"**{shadow['reassessed']:.1f}°F**{note}",
+                        inline=True)
     footer = "XGBoost · KNYC ASOS + upstream · aviationweather.gov · NWS CLI"
+    if shadow:
+        footer += "\n🧪 v2 adds NWS forecast guidance (GFS MOS, LAMP, NBM); trial only, current model is official"
     degraded = data.get("degraded") or []
     if degraded:
         footer += f"\n⚠️ {len(degraded)} upstream station(s) unavailable: {', '.join(degraded)}"

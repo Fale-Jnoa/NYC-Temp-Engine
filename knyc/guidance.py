@@ -67,7 +67,7 @@ RUNTIME_COLS = ["gfs_nx_runtime", "gfs_tmp_runtime", "lav_runtime", "nbs_nx_runt
 
 # ── Fetch / clean ───────────────────────────────────────────────────────────
 def fetch_runs(model: str, sts: datetime, ets: datetime, *, retries: int = 4,
-               pause_s: float = 3.0, timeout_s: int = 120) -> pd.DataFrame:
+               pause_s: float = 3.0, timeout_s: int = 120, backoff_s: float = 15.0) -> pd.DataFrame:
     """Raw MOS rows for KNYC with runtime in [sts, ets] (both inclusive)."""
     params = {"station": STATION, "model": model, "format": "csv",
               "sts": pd.Timestamp(sts).strftime("%Y-%m-%dT%H:%MZ"),
@@ -82,7 +82,8 @@ def fetch_runs(model: str, sts: datetime, ets: datetime, *, retries: int = 4,
             last = f"HTTP {r.status_code}: {r.text[:80]!r}"
         except (requests.ConnectionError, requests.Timeout) as exc:
             last = repr(exc)
-        time.sleep(15 * (attempt + 1))
+        if attempt < retries - 1:
+            time.sleep(backoff_s * (attempt + 1))
     raise RuntimeError(f"MOS fetch {model} {params['sts']}..{params['ets']} failed: {last}")
 
 
@@ -158,11 +159,11 @@ class RunMatrix:
 
     def __init__(self, runs: pd.DataFrame):
         if runs.empty:
-            self.runtimes = pd.DatetimeIndex([], tz="UTC")
+            self.runtimes = pd.DatetimeIndex([], tz="UTC").as_unit("ns")
             self.lead = self.tmp = np.empty((0, 1))
             return
         r = runs.sort_values(["runtime", "lead"])
-        self.runtimes = pd.DatetimeIndex(r["runtime"].drop_duplicates())
+        self.runtimes = pd.DatetimeIndex(r["runtime"].drop_duplicates()).as_unit("ns")
         row = self.runtimes.get_indexer(r["runtime"])
         col = r.groupby("runtime").cumcount().to_numpy()
         K = int(col.max()) + 1
@@ -299,7 +300,8 @@ def _mos_block(prefix: str, runs: pd.DataFrame, lag: pd.Timedelta, tmp_max_age: 
     nx["tdate"] = (nx["ftime"] - pd.Timedelta(days=1)).dt.date
     nx = nx.sort_values(["tdate", "runtime"])
     nx["prev_n_x"] = nx.groupby("tdate")["n_x"].shift(1)
-    nx["avail"] = nx["runtime"] + lag
+    # ns everywhere: pandas 3 parses to microseconds, and merge_asof needs equal units.
+    nx["avail"] = (nx["runtime"] + lag).astype("datetime64[ns, UTC]")
     left = pd.DataFrame({"pos": np.arange(n), "cutoff": pd.to_datetime(cutoff, utc=True),
                          "tdate": target_date(pd.Series(valid_ts)).to_numpy()}).sort_values("cutoff")
     m = pd.merge_asof(left, nx.sort_values("avail")[["avail", "tdate", "runtime", "n_x", "prev_n_x"]],
@@ -343,9 +345,11 @@ def guidance_features(rows: pd.DataFrame, gfs: pd.DataFrame, lav: pd.DataFrame,
     arrived yet (late-bulletin masking).
     """
     n = len(rows)
-    valid_ts = pd.DatetimeIndex(rows["valid"]).tz_convert("UTC")
+    # All int64 arithmetic below is in nanoseconds; pandas 3 defaults to
+    # microsecond resolution, so pin the unit (cf. the 2026-11 solar bug).
+    valid_ts = pd.DatetimeIndex(rows["valid"]).tz_convert("UTC").as_unit("ns")
     tmpf = rows["tmpf"].to_numpy(dtype=float)
-    w0 = pd.DatetimeIndex(climate_window_start(pd.Series(valid_ts))).asi8
+    w0 = pd.DatetimeIndex(climate_window_start(pd.Series(valid_ts))).as_unit("ns").asi8
     w1 = w0 + 24 * 3_600_000_000_000
     skip = np.broadcast_to(np.asarray(skip_newest, dtype=bool), (n,))
     cols = {}

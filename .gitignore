@@ -32,3 +32,5 @@ __pycache__/
 
 # Candidate model binaries - regenerate with python -m knyc.train_guidance
 models/candidates/**/*.pkl
+# ...except the model running side by side on the server (docs/PLAN_GUIDANCE_V2.md)
+!models/candidates/guidance_v2/*.pkl
