@@ -28,6 +28,15 @@ RESIDUAL_MODEL = MODELS_DIR / "residual_model.csv"
 
 # Training data
 TRAINING_CSV = DATA_DIR / "knyc_training.csv"
+TRAINING_TAIL_CSV = DATA_DIR / "knyc_training_tail.csv"   # obs after the base CSV ends
+SERVER_PULL_DIR = DATA_DIR / "server_pull"
+
+# Forecast guidance (docs/PLAN_GUIDANCE_RETRAIN.md)
+GUIDANCE_DIR = DATA_DIR / "guidance"
+GUIDANCE_RAW_DIR = GUIDANCE_DIR / "raw"
+GUIDANCE_FEATURES = GUIDANCE_DIR / "guidance_features.csv"
+CANDIDATES_DIR = MODELS_DIR / "candidates"
+SHADOW_LOG = LOGS_DIR / "shadow_log.csv"   # phase 5; not a legacy runtime file
 
 # Runtime files written by the bot
 NOWCAST_LOG = LOGS_DIR / "nowcast_log.csv"

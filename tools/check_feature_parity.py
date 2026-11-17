@@ -38,6 +38,7 @@ os.environ.setdefault("GUILD_ID", "1")
 
 import knyc_discord_bot as bot  # noqa: E402
 from knyc import build_training_data as btd  # noqa: E402
+from knyc import guidance  # noqa: E402
 
 DAYS = 4
 TOL = 1e-6
@@ -77,6 +78,24 @@ def part_a(end: datetime) -> list[str]:
                 problems.append(col)
     if not problems:
         print("   OK - every non-exempt feature matches")
+
+    # Guidance retrain observation feature (docs/PLAN_GUIDANCE_RETRAIN.md):
+    # the training path (knyc.guidance.obs_day_features) must equal the bot's
+    # live floor (_observed_high on the rows seen so far, civil date of valid_t).
+    obs = train.reset_index()[["valid", "tmpf", "mxtmpf_6hr"]]
+    feat = guidance.obs_day_features(obs)["obs_high_so_far"]
+    ny_date = obs["valid"].dt.tz_convert("America/New_York").dt.date
+    bot_vals = np.array([
+        (lambda v: np.nan if v is None else v)(bot._observed_high(obs.iloc[: i + 1], ny_date.iloc[i]))
+        for i in range(len(obs))])
+    both = ~np.isnan(bot_vals) & feat.notna().to_numpy()
+    nan_mismatch = int((np.isnan(bot_vals) != feat.isna().to_numpy()).sum())
+    diff = float(np.abs(bot_vals[both] - feat.to_numpy()[both]).max()) if both.any() else 0.0
+    if diff > TOL or nan_mismatch:
+        print(f"   MISMATCH obs_high_so_far        max|diff|={diff:.4g}  NaN-mismatch={nan_mismatch}")
+        problems.append("obs_high_so_far")
+    else:
+        print(f"   OK - obs_high_so_far matches the bot's floor on all {len(obs)} rows")
     return problems
 
 

@@ -1,0 +1,40 @@
+{
+  "selected": "C2",
+  "variants": {
+    "A0": {
+      "n_features": 91,
+      "train_rows": 96849,
+      "best_iteration": 1933,
+      "val_mae": 1.9148489643429996,
+      "val_mae_h0_12": 2.6539007977033755
+    },
+    "A1": {
+      "n_features": 93,
+      "train_rows": 96849,
+      "best_iteration": 2022,
+      "val_mae": 1.6802662790734473,
+      "val_mae_h0_12": 2.6226722173393555
+    },
+    "B1": {
+      "n_features": 101,
+      "train_rows": 96849,
+      "best_iteration": 1028,
+      "val_mae": 1.3072950540042996,
+      "val_mae_h0_12": 1.897114301642223
+    },
+    "C1": {
+      "n_features": 106,
+      "train_rows": 96849,
+      "best_iteration": 916,
+      "val_mae": 1.294232653003185,
+      "val_mae_h0_12": 1.8635546183195684
+    },
+    "C2": {
+      "n_features": 106,
+      "train_rows": 24335,
+      "best_iteration": 208,
+      "val_mae": 1.3449112297849286,
+      "val_mae_h0_12": 1.8305204967009094
+    }
+  }
+}

@@ -29,3 +29,6 @@ __pycache__/
 
 # Local Claude Code settings
 .claude/
+
+# Candidate model binaries - regenerate with python -m knyc.train_guidance
+models/candidates/**/*.pkl
